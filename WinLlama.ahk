@@ -119,6 +119,9 @@ ActiveMcpDirectories := ""
 
 ActiveConfigDialog := 0
 
+ServerManagerState := 0
+ServerEditorState := 0
+
 ActivePollRate := 0
 FastPollRate := 1000
 IdlePollRate := 5000
@@ -4493,6 +4496,363 @@ WaitForReady(URL, TimeoutMs) {
 }
 
 ; ============================================================
+;  LLAMA SERVER MANAGEMENT UI
+; ============================================================
+
+OpenServerManager(ParentGui, SelectedServerKey := "", OnChanged := 0) {
+    global ServerManagerState
+    global BaseColor, TextColor, MutedColor
+
+    if IsObject(ServerManagerState) {
+        try {
+            ServerManagerState.Gui.Show()
+            WinActivate("ahk_id " ServerManagerState.Gui.Hwnd)
+            return
+        }
+        catch
+            ServerManagerState := 0
+    }
+
+    ManagerGui := Gui(, "Llama Servers")
+    ManagerGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
+    ParentGui.Opt("+Disabled")
+    ManagerGui.BackColor := BaseColor
+    ManagerGui.MarginX := 24
+    ManagerGui.MarginY := 20
+    ApplyDarkWindow(ManagerGui)
+
+    ManagerGui.SetFont("s14 Bold c" TextColor, "Segoe UI")
+    ManagerGui.AddText("xm w480 Center", "LLAMA SERVERS")
+
+    ManagerGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
+    ManagerGui.AddText("x24 y70", "Registered server")
+    ServerControl := ManagerGui.AddDropDownList("x24 y99 w382 +0x210", [])
+    ApplyDarkControl(ServerControl)
+
+    ManagerGui.SetFont("s11 c" TextColor, "Segoe UI")
+    EditButton := ManagerGui.AddButton("x414 y98 w26 h26", "…")
+    AddButton := ManagerGui.AddButton("x446 yp w26 h26", "+")
+
+    ManagerGui.SetFont("s13 c" TextColor, "Segoe UI")
+    DeleteButton := ManagerGui.AddButton("x478 yp w26 h26", "×")
+
+    MakeOwnerDrawButton(EditButton)
+    MakeOwnerDrawButton(AddButton)
+    MakeOwnerDrawButton(DeleteButton)
+
+    ManagerGui.SetFont("s10 c" MutedColor, "Segoe UI")
+    SummaryText := ManagerGui.AddText("x24 y143 w480 h50", "")
+
+    ServerManagerState := {
+        Gui: ManagerGui, Parent: ParentGui, ServerControl: ServerControl, ServerKeys: [],
+        SummaryText: SummaryText, EditButton: EditButton, DeleteButton: DeleteButton,
+        OnChanged: OnChanged
+    }
+
+    ServerControl.OnEvent("Change", UpdateServerManagerDetails)
+    EditButton.OnEvent("Click", EditSelectedServer)
+    AddButton.OnEvent("Click", (*) => OpenServerEditor(ManagerGui))
+    DeleteButton.OnEvent("Click", DeleteSelectedServer)
+    ManagerGui.OnEvent("Close", CloseServerManager)
+
+    RefreshServerManager(SelectedServerKey)
+    ShowRelative(ManagerGui, ParentGui)
+}
+
+
+CloseServerManager(*) {
+    global ServerManagerState
+
+    if !IsObject(ServerManagerState)
+        return
+
+    State := ServerManagerState
+    try State.Gui.Destroy()
+    ServerManagerState := 0
+
+    State.Parent.Opt("-Disabled")
+    State.Parent.Show()
+    try WinActivate("ahk_id " State.Parent.Hwnd)
+}
+
+
+RefreshServerManager(PreferredServerKey := "") {
+    global ServerManagerState
+    global ServerList, Servers
+
+    if !IsObject(ServerManagerState)
+        return
+
+    State := ServerManagerState
+    if PreferredServerKey = ""
+        PreferredServerKey := GetSelectedServerManagerKey()
+
+    Names := []
+    Keys := []
+    SelectedIndex := 0
+
+    for ServerKey in ServerList {
+        if !Servers.Has(ServerKey)
+            continue
+
+        Keys.Push(ServerKey)
+        Names.Push(Servers[ServerKey].Name)
+
+        if ServerKey = PreferredServerKey
+            SelectedIndex := Keys.Length
+    }
+
+    State.ServerControl.Delete()
+    if Names.Length
+        State.ServerControl.Add(Names)
+
+    State.ServerKeys := Keys
+    if !SelectedIndex && Keys.Length
+        SelectedIndex := 1
+
+    State.ServerControl.Choose(SelectedIndex)
+    UpdateServerManagerDetails()
+}
+
+
+GetSelectedServerManagerKey() {
+    global ServerManagerState
+
+    if !IsObject(ServerManagerState)
+        return ""
+
+    Index := ServerManagerState.ServerControl.Value
+    if Index < 1 || Index > ServerManagerState.ServerKeys.Length
+        return ""
+
+    return ServerManagerState.ServerKeys[Index]
+}
+
+
+UpdateServerManagerDetails(*) {
+    global ServerManagerState
+    global Servers
+
+    if !IsObject(ServerManagerState)
+        return
+
+    State := ServerManagerState
+    ServerKey := GetSelectedServerManagerKey()
+
+    if ServerKey = "" || !Servers.Has(ServerKey) {
+        State.SummaryText.Text := "No llama servers are registered."
+        State.EditButton.Enabled := false
+        State.DeleteButton.Enabled := false
+        return
+    }
+
+    Server := Servers[ServerKey]
+    State.SummaryText.Text := Server.Address ":" Server.Port "`n" Server.Executable
+    State.EditButton.Enabled := true
+    State.DeleteButton.Enabled := true
+}
+
+
+EditSelectedServer(*) {
+    global ServerManagerState
+
+    ServerKey := GetSelectedServerManagerKey()
+    if ServerKey != ""
+        OpenServerEditor(ServerManagerState.Gui, ServerKey)
+}
+
+
+DeleteSelectedServer(*) {
+    global Servers
+
+    ServerKey := GetSelectedServerManagerKey()
+    if ServerKey = "" || !Servers.Has(ServerKey)
+        return
+
+    Server := Servers[ServerKey]
+    ModelNames := GetModelsUsingServer(ServerKey)
+    Message := "Delete llama server '" Server.Name "'?"
+
+    if ModelNames.Length {
+        Message .= "`n`nThis server is referenced by:"
+        for ModelName in ModelNames
+            Message .= "`n  • " ModelName
+
+        Message .= "`n`nThose models will not be startable until another server is assigned."
+    }
+
+    if MsgBox(Message, "Delete Llama Server", "YesNo Icon?") != "Yes"
+        return
+
+    DeleteServer(ServerKey)
+    RefreshServerManager()
+    NotifyServerManagerChanged(GetSelectedServerManagerKey())
+}
+
+
+OpenServerEditor(ParentGui, ServerKey := "") {
+    global ServerEditorState
+    global Servers
+    global BaseColor, SecondaryColor, TextColor, MutedColor
+
+    if IsObject(ServerEditorState) {
+        try {
+            ServerEditorState.Gui.Show()
+            WinActivate("ahk_id " ServerEditorState.Gui.Hwnd)
+            return
+        }
+        catch
+            ServerEditorState := 0
+    }
+
+    Editing := ServerKey != "" && Servers.Has(ServerKey)
+    Server := Editing
+        ? Servers[ServerKey]
+        : {Name: "", Executable: "", Address: "127.0.0.1", Port: 18080, Args: ""}
+
+    EditorGui := Gui(, Editing ? "Edit Llama Server" : "Add Llama Server")
+    EditorGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
+    ParentGui.Opt("+Disabled")
+    EditorGui.BackColor := BaseColor
+    EditorGui.MarginX := 24
+    EditorGui.MarginY := 20
+    ApplyDarkWindow(EditorGui)
+
+    EditorGui.SetFont("s14 Bold c" TextColor, "Segoe UI")
+    EditorGui.AddText("xm w480 Center", Editing ? "EDIT LLAMA SERVER" : "ADD LLAMA SERVER")
+
+    EditorGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
+    EditorGui.AddText("x24 y70", "Name")
+    NameEdit := EditorGui.AddEdit("x24 y99 w480 Background" SecondaryColor " c" TextColor, Server.Name)
+
+    EditorGui.AddText("x24 y145", "Executable")
+    ExecutableEdit := EditorGui.AddEdit(
+        "x24 y174 w438 Background" SecondaryColor " c" TextColor, Server.Executable
+    )
+
+    EditorGui.SetFont("s11 c" TextColor, "Segoe UI")
+    BrowseButton := EditorGui.AddButton("x470 y173 w34 h26", "…")
+    MakeOwnerDrawButton(BrowseButton)
+
+    EditorGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
+    EditorGui.AddText("x24 y220", "Address")
+    EditorGui.AddText("x374 y220", "Port")
+    AddressEdit := EditorGui.AddEdit(
+        "x24 y249 w330 Background" SecondaryColor " c" TextColor, Server.Address
+    )
+    PortEdit := EditorGui.AddEdit(
+        "x374 y249 w130 Number Background" SecondaryColor " c" TextColor, Server.Port
+    )
+
+    EditorGui.AddText("x24 y295", "Optional arguments")
+    ArgsEdit := EditorGui.AddEdit("x24 y324 w480 Background" SecondaryColor " c" TextColor, Server.Args)
+
+    EditorGui.SetFont("s10 c" MutedColor, "Segoe UI")
+    EditorGui.AddText(
+        "x24 y365 w480",
+        Editing ? "INI section: [" ServerKey "]" : "INI section will be generated from the server name."
+    )
+
+    EditorGui.SetFont("s12 c" TextColor, "Segoe UI")
+    SaveButton := EditorGui.AddButton("x24 y397 w230 h42", "Save")
+    CancelButton := EditorGui.AddButton("x274 yp w230 h42", "Cancel")
+    MakeOwnerDrawButton(SaveButton)
+    MakeOwnerDrawButton(CancelButton)
+
+    ServerEditorState := {
+        Gui: EditorGui, Parent: ParentGui, ServerKey: ServerKey, NameEdit: NameEdit,
+        ExecutableEdit: ExecutableEdit, AddressEdit: AddressEdit, PortEdit: PortEdit, ArgsEdit: ArgsEdit
+    }
+
+    BrowseButton.OnEvent("Click", (*) => BrowseServerExecutable(ExecutableEdit))
+    SaveButton.OnEvent("Click", SaveServerEditor)
+    CancelButton.OnEvent("Click", CloseServerEditor)
+    EditorGui.OnEvent("Close", CloseServerEditor)
+    ShowRelative(EditorGui, ParentGui)
+}
+
+
+BrowseServerExecutable(ExecutableEdit) {
+    SelectedPath := FileSelect(
+        1, Trim(ExecutableEdit.Text), "Select llama-server executable", "Programs (*.exe)"
+    )
+
+    if SelectedPath != ""
+        ExecutableEdit.Text := SelectedPath
+}
+
+
+SaveServerEditor(*) {
+    global ServerEditorState
+
+    if !IsObject(ServerEditorState)
+        return
+
+    State := ServerEditorState
+    Name := Trim(State.NameEdit.Text)
+    Executable := Trim(State.ExecutableEdit.Text)
+    Address := Trim(State.AddressEdit.Text)
+    Port := Trim(State.PortEdit.Text)
+    Args := Trim(State.ArgsEdit.Text)
+
+    if Name = "" {
+        MsgBox("Enter a name for the llama server.", "Llama Server", "Icon!")
+        return
+    }
+
+    if Executable = "" {
+        MsgBox("Enter the llama-server executable location.", "Llama Server", "Icon!")
+        return
+    }
+
+    if Address = "" {
+        MsgBox("Enter the address used by the llama server.", "Llama Server", "Icon!")
+        return
+    }
+
+    if !IsInteger(Port) || Port < 1 || Port > 65535 {
+        MsgBox("Port must be an integer from 1 through 65535.", "Llama Server", "Icon!")
+        return
+    }
+
+    SavedKey := State.ServerKey != ""
+        ? SaveServer(State.ServerKey, Name, Executable, Address, Port, Args)
+        : AddServer(Name, Executable, Address, Port, Args)
+
+    CloseServerEditor()
+    RefreshServerManager(SavedKey)
+    NotifyServerManagerChanged(SavedKey)
+}
+
+
+CloseServerEditor(*) {
+    global ServerEditorState
+
+    if !IsObject(ServerEditorState)
+        return
+
+    State := ServerEditorState
+    try State.Gui.Destroy()
+    ServerEditorState := 0
+
+    State.Parent.Opt("-Disabled")
+    State.Parent.Show()
+    try WinActivate("ahk_id " State.Parent.Hwnd)
+}
+
+
+NotifyServerManagerChanged(ServerKey := "") {
+    global ServerManagerState
+
+    if !IsObject(ServerManagerState)
+        return
+
+    Callback := ServerManagerState.OnChanged
+    if IsObject(Callback)
+        Callback.Call(ServerKey)
+}
+
+; ============================================================
 ;  SERVERS
 ; ============================================================
 
@@ -4651,6 +5011,23 @@ DeleteServer(ServerKey) {
 
     return true
 }
+
+
+GetModelsUsingServer(ServerKey) {
+    global Models, ModelList
+
+    ModelNames := []
+    SearchKey := StrLower(Trim(ServerKey))
+
+    for ModelKey in ModelList {
+        if Models.Has(ModelKey)
+        && StrLower(Trim(Models[ModelKey].ServerKey)) = SearchKey
+            ModelNames.Push(Models[ModelKey].Name)
+    }
+
+    return ModelNames
+}
+
 
 ServerExists(ServerKey) {
     global Servers
