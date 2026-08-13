@@ -11,6 +11,14 @@ if !InstanceMutex
 OnExit(CleanupOwnedServices)
 
 ; ============================================================
+;  APPLICATION
+; ============================================================
+
+AppName := "WinLlama LLM"
+AppVersion := "0.1.0"
+AppWindowTitle := AppName " v" AppVersion
+
+; ============================================================
 ;  THEME
 ; ============================================================
 
@@ -53,54 +61,45 @@ ServerList := ConfigReadList(
 LastModel := ConfigRead(
     "State",
     "LastModel",
+    ""
+)
+
+SavedWindowCenterX := Trim(
     ConfigRead(
-        "General",
-        "LastModel",
+        "State",
+        "WindowCenterX",
         ""
     )
 )
 
-; Legacy runtime value until registered llama servers take ownership
-; of address/port in the next stages.
-LegacyLlamaPort := ConfigReadInteger(
-    "General",
-    "LlamaPort",
-    18080
-)
-
-LegacyMcpMode := StrLower(
-    Trim(
-        ConfigRead(
-            "MCP",
-            "Mode",
-            ""
-        )
+SavedWindowCenterY := Trim(
+    ConfigRead(
+        "State",
+        "WindowCenterY",
+        ""
     )
 )
+
+if !IsInteger(SavedWindowCenterX)
+    SavedWindowCenterX := ""
+
+if !IsInteger(SavedWindowCenterY)
+    SavedWindowCenterY := ""
 
 McpEnabled := ConfigReadBoolean(
     "MCP",
     "Enabled",
-    true
+    false
 )
 
-; Remote MCP support existed briefly during development. An old Remote
-; configuration must not be reinterpreted as a local bind target.
-if LegacyMcpMode != "" {
-    if LegacyMcpMode = "remote" {
-        McpEnabled := false
-        ConfigWrite(
-            "MCP",
-            "Enabled",
-            "false"
-        )
-    }
+McpProxyExecutable := ConfigRead(
+    "MCP",
+    "ProxyExecutable",
+    ""
+)
 
-    try ConfigDeleteKey(
-        "MCP",
-        "Mode"
-    )
-}
+if Trim(McpProxyExecutable) = ""
+    McpProxyExecutable := DiscoverMcpProxyExecutable()
 
 McpAddress := ConfigRead(
     "MCP",
@@ -111,7 +110,7 @@ McpAddress := ConfigRead(
 McpPort := ConfigReadInteger(
     "MCP",
     "Port",
-    18081,
+    8081,
     1,
     65535
 )
@@ -119,12 +118,35 @@ McpPort := ConfigReadInteger(
 McpDirectories := ConfigRead(
     "MCP",
     "GlobalDirectories",
-    ConfigRead(
-        "MCP",
-        "Directories",
-        ""
-    )
+    ""
 )
+
+ContextPresets := [
+    "4096",
+    "8192",
+    "12288",
+    "16384",
+    "24576",
+    "32768",
+    "49152",
+    "65536",
+    "98304",
+    "131072",
+    "196608",
+    "262144"
+]
+
+KvCacheOptions := [
+    "f32",
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "iq4_nl",
+    "q5_0",
+    "q5_1"
+]
 
 LogsDirectory := ResolvePath(
     ConfigRead(
@@ -133,8 +155,6 @@ LogsDirectory := ResolvePath(
         "Logs"
     )
 )
-
-MigrateLegacyServerConfiguration()
 
 Servers := LoadServers()
 Models := LoadModels()
@@ -182,8 +202,8 @@ McpProbeSuppressed := false
 
 LlamaStartupUntil := 0
 McpStartupUntil := 0
-LlamaStartupGrace := 30000
-McpStartupGrace := 15000
+LlamaStartupGrace := 60000
+McpStartupGrace := 20000
 
 ; ============================================================
 ; LOG VIEWER GLOBALS
@@ -215,150 +235,6 @@ DarkButtonFillOverrides := Map()
 SetupHostGui := 0
 SetupSelectedModelKey := ""
 
-; --------------- ----------- - -----TEMPORARY MIGRATION STUFF
-MigrateLegacyServerConfiguration() {
-    global ModelList
-    global ServerList
-    global LegacyLlamaPort
-
-    ServersByExecutable := Map()
-    ServerListChanged := false
-
-
-    ; --------------------------------------------------------
-    ;  INDEX ALREADY-REGISTERED SERVERS
-    ; --------------------------------------------------------
-
-    for ServerKey in ServerList {
-        Executable :=
-            ConfigRead(
-                ServerKey,
-                "Executable",
-                ""
-            )
-
-        if Executable = ""
-            continue
-
-        ServersByExecutable[
-            NormalizeConfigPath(
-                Executable
-            )
-        ] := ServerKey
-    }
-
-
-    ; --------------------------------------------------------
-    ;  MIGRATE LEGACY MODEL SERVER PATHS
-    ; --------------------------------------------------------
-
-    for ModelKey in ModelList {
-        ServerValue :=
-            Trim(
-                ConfigRead(
-                    ModelKey,
-                    "Server",
-                    ""
-                )
-            )
-
-        if ServerValue = ""
-            continue
-
-
-        ; Already a registered server key.
-        if ListContainsValue(
-            ServerList,
-            ServerValue
-        )
-            continue
-
-
-        ; An unknown non-path value is treated as a dangling
-        ; server reference, not something migration should invent.
-        if !LooksLikeConfigPath(
-            ServerValue
-        )
-            continue
-
-
-        ExecutableKey :=
-            NormalizeConfigPath(
-                ServerValue
-            )
-
-
-        ; ----------------------------------------------------
-        ;  REUSE AN EXISTING SERVER FOR THE SAME EXECUTABLE
-        ; ----------------------------------------------------
-
-        if ServersByExecutable.Has(
-            ExecutableKey
-        ) {
-            ServerKey :=
-                ServersByExecutable[
-                    ExecutableKey
-                ]
-        }
-
-
-        ; ----------------------------------------------------
-        ;  REGISTER A NEW SERVER
-        ; ----------------------------------------------------
-
-        else {
-            Name :=
-                DeriveServerName(
-                    ServerValue
-                )
-
-            ServerKey :=
-                GenerateConfigKey(
-                    Name,
-                    "Server"
-                )
-
-            ConfigWriteMany(
-                ServerKey,
-                Map(
-                    "Name", Name,
-                    "Executable", ServerValue,
-                    "Address", "127.0.0.1",
-                    "Port", LegacyLlamaPort,
-                    "Args", ""
-                )
-            )
-
-            ServerList.Push(
-                ServerKey
-            )
-
-            ServersByExecutable[
-                ExecutableKey
-            ] := ServerKey
-
-            ServerListChanged := true
-        }
-
-
-        ; Model now references the registered server.
-        ConfigWrite(
-            ModelKey,
-            "Server",
-            ServerKey
-        )
-    }
-
-
-    if ServerListChanged {
-        ConfigWriteList(
-            "General",
-            "ServerList",
-            ServerList
-        )
-    }
-}
-
 ; ============================================================
 ;  CONFIGURATION BOOTSTRAP
 ; ============================================================
@@ -369,19 +245,26 @@ EnsureConfigFile() {
     if FileExist(ConfigFile)
         return false
 
-    Template :=
-        "[General]`r`n"
-        . "ModelList=`r`n"
-        . "ServerList=`r`n"
-        . "LogsDirectory=Logs`r`n`r`n"
-        . "[State]`r`n`r`n"
-        . "[MCP]`r`n"
-        . "Enabled=false`r`n"
-        . "Address=127.0.0.1`r`n"
-        . "Port=18081`r`n"
-        . "GlobalDirectories=`r`n"
+    ConfigWriteMany(
+        "General",
+        Map(
+            "ModelList", "",
+            "ServerList", "",
+            "LogsDirectory", "Logs"
+        )
+    )
 
-    FileAppend(Template, ConfigFile, "UTF-8")
+    ConfigWriteMany(
+        "MCP",
+        Map(
+            "Enabled", "false",
+            "ProxyExecutable", "",
+            "Address", "127.0.0.1",
+            "Port", 8081,
+            "GlobalDirectories", ""
+        )
+    )
+
     return true
 }
 
@@ -608,7 +491,7 @@ FinishSetupSequence() {
 
     RefreshMainModelControl(PreferredModelKey)
     UpdateMainModelInfo()
-    MainGui.Show("w572")
+    ShowStartupWindow()
     WinActivate("ahk_id " MainGui.Hwnd)
 }
 
@@ -673,34 +556,6 @@ RemoveListValue(List, Value) {
     }
 
     return false
-}
-
-
-LooksLikeConfigPath(Value) {
-    Value := Trim(Value)
-
-    if Value = ""
-        return false
-
-    return RegExMatch(
-        Value,
-        "i)^(?:[A-Z]:[\\/]|\\\\|//|\.[\\/])"
-    )
-        || InStr(Value, "\")
-        || InStr(Value, "/")
-}
-
-
-NormalizeConfigPath(Path) {
-    Path := Trim(Path)
-
-    return StrLower(
-        StrReplace(
-            Path,
-            "/",
-            "\"
-        )
-    )
 }
 
 
@@ -959,34 +814,26 @@ DeleteModel(ModelKey) {
     return true
 }
 
-SaveMcpDefaults(Enabled, Address, Port, Directories) {
-    global McpEnabled, McpAddress, McpPort
+SaveMcpDefaults(Enabled, ProxyExecutable, Address, Port, Directories) {
+    global McpEnabled, McpProxyExecutable, McpAddress, McpPort
     global McpDirectories
 
+    ProxyExecutable := Trim(ProxyExecutable)
     Address := Trim(Address)
 
     ConfigWriteMany(
         "MCP",
         Map(
             "Enabled", Enabled ? "true" : "false",
+            "ProxyExecutable", ProxyExecutable,
             "Address", Address,
             "Port", Port,
             "GlobalDirectories", Directories
         )
     )
 
-    ; Retire keys from earlier MCP configuration shapes.
-    try ConfigDeleteKey(
-        "MCP",
-        "Directories"
-    )
-
-    try ConfigDeleteKey(
-        "MCP",
-        "Mode"
-    )
-
     McpEnabled := Enabled
+    McpProxyExecutable := ProxyExecutable
     McpAddress := Address
     McpPort := Port
     McpDirectories := Directories
@@ -1078,32 +925,6 @@ GenerateConfigKey(
     return Candidate
 }
 
-DeriveServerName(Executable) {
-    SplitPath(
-        Executable,
-        &FileName,
-        &Directory,
-        &Extension,
-        &NameNoExt
-    )
-
-    if StrLower(NameNoExt) = "llama-server"
-    && Directory != "" {
-        SplitPath(
-            Directory,
-            &FolderName
-        )
-
-        if FolderName != ""
-            return FolderName
-    }
-
-    if NameNoExt != ""
-        return NameNoExt
-
-    return "Llama Server"
-}
-
 ; ============================================================
 ;  TRAY MENU
 ; ============================================================
@@ -1119,13 +940,13 @@ A_TrayMenu.Add("Shutdown All", ShutdownAll)
 A_TrayMenu.Default := "Open Controller"
 A_TrayMenu.ClickCount := 2
 
-A_IconTip := "Local AI Controller"
+A_IconTip := AppName
 
 ; ============================================================
 ;  STARTUP WINDOW
 ; ============================================================
 
-MainGui := Gui(, "Local AI")
+MainGui := Gui(, AppWindowTitle)
 MainGui.BackColor := BaseColor
 MainGui.MarginX := 26
 MainGui.MarginY := 22
@@ -1133,7 +954,7 @@ MainGui.MarginY := 22
 ApplyDarkWindow(MainGui)
 
 MainGui.SetFont("s16 Bold c" TextColor, "Segoe UI")
-MainGui.AddText("xm w520 Center", "LOCAL AI")
+MainGui.AddText("xm w520 Center", "WINLLAMA LLM")
 
 MainGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
 MainGui.AddText("xm y+24", "Model")
@@ -1250,7 +1071,7 @@ UpdateMainModelInfo()
 if NeedsSetup
     StartSetupSequence()
 else
-    MainGui.Show("w572")
+    ShowStartupWindow()
 
 
 ; ============================================================
@@ -1348,6 +1169,7 @@ OpenMainMcpEditor(*) {
 class ModelConfigPanel {
     __New(GuiObj, X, Y, Width, ModelKey, Context := "", Cache := "", ServerKey := "") {
         global SecondaryColor, TextColor, MutedColor
+        global ContextPresets, KvCacheOptions
 
         this.Gui := GuiObj
         this.Width := Width
@@ -1391,7 +1213,7 @@ class ModelConfigPanel {
 
         this.ContextControl := GuiObj.AddComboBox(
             "x" X " y" Y " w" Width " +0x210 Background" SecondaryColor " c" TextColor,
-            ["16384", "24576", "32768"]
+            ContextPresets
         )
         ApplyDarkControl(this.ContextControl)
 
@@ -1401,7 +1223,7 @@ class ModelConfigPanel {
 
         this.CacheControl := GuiObj.AddDropDownList(
             "x" X " y" Y " w" Width " +0x210",
-            ["f16", "q8_0", "q4_0"]
+            KvCacheOptions
         )
         ApplyDarkControl(this.CacheControl)
 
@@ -1410,7 +1232,10 @@ class ModelConfigPanel {
         Y += 25
 
         GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
-        GuiObj.AddText("x" X " y" Y " w" Width, "Additional filesystem roots owned by this model.")
+        GuiObj.AddText(
+            "x" X " y" Y " w" (Width - 46),
+            "Additional filesystem roots owned by this model."
+        )
         Y += 25
 
         GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
@@ -1418,6 +1243,13 @@ class ModelConfigPanel {
             "x" X " y" Y " w" Width " r3 -VScroll Background" SecondaryColor " c" TextColor,
             ""
         )
+
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
+        this.McpBrowseButton := GuiObj.AddButton(
+            "x" (X + Width - 36) " y" (Y - 32) " w34 h26",
+            "…"
+        )
+        MakeOwnerDrawButton(this.McpBrowseButton)
 
         Y += 82
         GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
@@ -1431,6 +1263,10 @@ class ModelConfigPanel {
         this.EditServerButton.OnEvent("Click", ObjBindMethod(this, "EditSelectedServer"))
         this.AddServerButton.OnEvent("Click", ObjBindMethod(this, "AddServer"))
         this.DeleteServerButton.OnEvent("Click", ObjBindMethod(this, "DeleteSelectedServer"))
+        this.McpBrowseButton.OnEvent(
+            "Click",
+            (*) => BrowseMcpDirectory(this.McpDirectoriesEdit)
+        )
 
         this.RefreshModels(ModelKey, false)
         this.SetValues(ModelKey, Context, Cache, ServerKey)
@@ -1468,6 +1304,7 @@ class ModelConfigPanel {
         this.ContextControl.Enabled := HasModel
         this.CacheControl.Enabled := HasModel
         this.McpDirectoriesEdit.Enabled := HasModel
+        this.McpBrowseButton.Enabled := HasModel
 
         if ResetValues && HasModel
             this.ResetToModelDefaults()
@@ -1733,7 +1570,7 @@ class ModelConfigPanel {
 }
 
 class McpConfigPanel {
-    __New(GuiObj, X, Y, Width, Enabled, Address, Port, Directories) {
+    __New(GuiObj, X, Y, Width, Enabled, ProxyExecutable, Address, Port, Directories) {
         global SecondaryColor, TextColor, MutedColor
 
         this.Gui := GuiObj
@@ -1752,8 +1589,29 @@ class McpConfigPanel {
         ApplyDarkControl(this.EnabledControl)
 
         Y += 50
+        GuiObj.AddText("x" X " y" Y, "mcp-proxy executable")
+        Y += 29
+
+        this.ProxyExecutableEdit := GuiObj.AddEdit(
+            "x" X " y" Y
+            . " w" (Width - 42)
+            . " r1 -Multi"
+            . " Background" SecondaryColor
+            . " c" TextColor,
+            ProxyExecutable
+        )
+
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
+        this.ProxyBrowseButton := GuiObj.AddButton(
+            "x+8 yp w34 h26",
+            "…"
+        )
+        MakeOwnerDrawButton(this.ProxyBrowseButton)
+
+        Y += 50
         AddressWidth := Width - 124
 
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
         GuiObj.AddText("x" X " y" Y, "Bind address")
         GuiObj.AddText("x" (X + AddressWidth + 20) " yp", "Port")
         Y += 29
@@ -1761,6 +1619,7 @@ class McpConfigPanel {
         this.AddressEdit := GuiObj.AddEdit(
             "x" X " y" Y
             . " w" AddressWidth
+            . " r1 -Multi"
             . " Background" SecondaryColor
             . " c" TextColor,
             Address
@@ -1769,6 +1628,7 @@ class McpConfigPanel {
         this.PortEdit := GuiObj.AddEdit(
             "x" (X + AddressWidth + 20) " yp"
             . " w104"
+            . " r1 -Multi"
             . " Background" SecondaryColor
             . " c" TextColor,
             Port
@@ -1780,7 +1640,7 @@ class McpConfigPanel {
 
         GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
         this.DirectoryHelp := GuiObj.AddText(
-            "x" X " y" Y " w" Width,
+            "x" X " y" Y " w" (Width - 46),
             "Available to every model through the local filesystem MCP."
         )
         Y += 25
@@ -1796,10 +1656,28 @@ class McpConfigPanel {
             DirectoriesForEdit(Directories)
         )
 
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
+        this.DirectoryBrowseButton := GuiObj.AddButton(
+            "x" (X + Width - 36) " y" (Y - 32) " w34 h26",
+            "…"
+        )
+        MakeOwnerDrawButton(this.DirectoryBrowseButton)
+
+        this.ProxyBrowseButton.OnEvent(
+            "Click",
+            (*) => BrowseMcpProxyExecutable(this.ProxyExecutableEdit)
+        )
+
+        this.DirectoryBrowseButton.OnEvent(
+            "Click",
+            (*) => BrowseMcpDirectory(this.DirectoryEdit)
+        )
+
         this.Bottom := Y + 94
 
         this.SetValues(
             Enabled,
+            ProxyExecutable,
             Address,
             Port,
             Directories
@@ -1807,8 +1685,9 @@ class McpConfigPanel {
     }
 
 
-    SetValues(Enabled, Address, Port, Directories) {
+    SetValues(Enabled, ProxyExecutable, Address, Port, Directories) {
         this.EnabledControl.Choose(Enabled ? 1 : 2)
+        this.ProxyExecutableEdit.Text := ProxyExecutable
         this.AddressEdit.Text := Address
         this.PortEdit.Text := Port
         this.SetDirectories(Directories)
@@ -1817,9 +1696,31 @@ class McpConfigPanel {
 
     GetValues() {
         Enabled := this.EnabledControl.Value = 1
+        ProxyExecutable := Trim(this.ProxyExecutableEdit.Text)
         Address := Trim(this.AddressEdit.Text)
         Port := Trim(this.PortEdit.Text)
         Directories := this.GetDirectories()
+
+        if Enabled && ProxyExecutable = "" {
+            MsgBox(
+                "Select the mcp-proxy executable while MCP is enabled.",
+                "MCP Access",
+                "Icon!"
+            )
+
+            return false
+        }
+
+        if ProxyExecutable != ""
+        && !FileExist(ProxyExecutable) {
+            MsgBox(
+                "mcp-proxy executable not found:`n`n" ProxyExecutable,
+                "MCP Access",
+                "Icon!"
+            )
+
+            return false
+        }
 
         if Enabled && Address = "" {
             MsgBox(
@@ -1843,6 +1744,7 @@ class McpConfigPanel {
 
         return {
             Enabled: Enabled,
+            ProxyExecutable: ProxyExecutable,
             Address: Address,
             Port: Port + 0,
             Directories: Directories
@@ -1915,8 +1817,9 @@ BuildActiveGui() {
 	global ActiveShutdownButton
 
     global BaseColor, TextColor, MutedColor
+    global AppWindowTitle
 
-    ActiveGui := Gui(, "Local AI")
+    ActiveGui := Gui(, AppWindowTitle)
     ActiveGui.BackColor := BaseColor
     ActiveGui.MarginX := 26
     ActiveGui.MarginY := 22
@@ -1935,7 +1838,7 @@ BuildActiveGui() {
 
     ActiveGui.AddText(
         "xm w520 Center",
-        "LOCAL AI"
+        "WINLLAMA LLM"
     )
 
 
@@ -2589,10 +2492,10 @@ OpenAddModelDialog(ParentGui, OnSaved := 0) {
 
     DialogGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
     DialogGui.AddText("x24 y70", "Name")
-    NameEdit := DialogGui.AddEdit("x24 y99 w480 Background" SecondaryColor " c" TextColor, "")
+    NameEdit := DialogGui.AddEdit("x24 y99 w480 r1 -Multi Background" SecondaryColor " c" TextColor, "")
 
     DialogGui.AddText("x24 y145", "GGUF model")
-    ModelPathEdit := DialogGui.AddEdit("x24 y174 w438 Background" SecondaryColor " c" TextColor, "")
+    ModelPathEdit := DialogGui.AddEdit("x24 y174 w438 r1 -Multi Background" SecondaryColor " c" TextColor, "")
 
     DialogGui.SetFont("s11 c" TextColor, "Segoe UI")
     BrowseButton := DialogGui.AddButton("x470 y173 w34 h26", "…")
@@ -2872,7 +2775,7 @@ OpenMcpEditor(*) {
 
 
 OpenMcpConfigEditor(ParentGui, AllowApply := false, SetupMode := false) {
-    global McpEnabled, McpAddress, McpPort
+    global McpEnabled, McpProxyExecutable, McpAddress, McpPort
     global McpDirectories
     global BaseColor, TextColor
 
@@ -2913,6 +2816,7 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false, SetupMode := false) {
         70,
         480,
         McpEnabled,
+        McpProxyExecutable,
         McpAddress,
         McpPort,
         McpDirectories
@@ -3075,6 +2979,7 @@ SaveMcpEditorConfig(McpPanel) {
 
     SaveMcpDefaults(
         Values.Enabled,
+        Values.ProxyExecutable,
         Values.Address,
         Values.Port,
         Values.Directories
@@ -3246,6 +3151,7 @@ OpenConsoleViewer(*) {
     global SecondaryColor
     global TextColor
     global MutedColor
+    global AppName
 
 
     ; --------------------------------------------------------
@@ -3301,7 +3207,7 @@ OpenConsoleViewer(*) {
 
     ConsoleGui := Gui(
         ,
-        "Local AI - Consoles"
+        AppName " - Consoles"
     )
 
     ConsoleGui.BackColor := BaseColor
@@ -4105,7 +4011,7 @@ StopProcessTree(Pid) {
 
 LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
 	global Models
-    global McpStartupUntil
+    global McpStartupUntil, McpStartupGrace
     global McpProbeSuppressed
     global ActiveMcpConfig, ActiveMcpDirectories
     global ActiveHasLaunched
@@ -4181,15 +4087,23 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
 
     ActiveMcpConfig := 0
     ActiveMcpDirectories := ""
-    McpStartupUntil := 0
-    McpProbeSuppressed := !DesiredMcp.Enabled
 
     if DesiredMcp.Enabled {
+        ; Preserve startup intent across the Start -> Active handoff.
+        ; EnterActiveView already establishes grace, but LaunchAI used to
+        ; clear it before StartMcp had a chance to refresh the deadline.
+        McpStartupUntil :=
+            A_TickCount
+            + McpStartupGrace
+
+        McpProbeSuppressed := false
         McpURL := GetMcpStatusURL(
             DesiredMcp
         )
 
         if HttpStatus(McpURL) != 0 {
+            McpStartupUntil := 0
+
             ActiveMcpConfig := CreateMcpRuntimeConfig(
                 DesiredMcp,
                 true,
@@ -4203,6 +4117,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
                 )
 
             if DesiredMcp.Directories = "" {
+                McpStartupUntil := 0
                 McpProbeSuppressed := true
 
                 if Trim(
@@ -4225,7 +4140,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
 
                     if !WaitForHttp(
                         McpURL,
-                        10000
+                        McpStartupGrace
                     ) {
                         MsgBox(
                             "MCP was started, but did not become available.`n`nThe model will continue without MCP.",
@@ -4250,6 +4165,10 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
                 }
             }
         }
+    }
+    else {
+        McpStartupUntil := 0
+        McpProbeSuppressed := true
     }
 
     UpdateMcpState()
@@ -4339,8 +4258,16 @@ StartMcp(Config) {
         Config.Address
     )
 
+    ProxyExecutable := Trim(Config.ProxyExecutable)
+
+    if ProxyExecutable = ""
+        throw Error("mcp-proxy executable is not configured.")
+
+    if !FileExist(ProxyExecutable)
+        throw Error("mcp-proxy executable not found: " ProxyExecutable)
+
     McpCommand :=
-        "mcp-proxy "
+        '"' ProxyExecutable '" '
         . "--host " Host " "
         . "--port " Config.Port " "
         . "--transport streamablehttp "
@@ -4645,12 +4572,18 @@ UpdateLlamaState() {
     global LlamaProbeSuppressed
 
 
-    ; If a process we owned has disappeared, we already know the service is
-    ; offline. Don't keep proving that with blocking HTTP requests forever.
+    InStartupGrace :=
+        LlamaStartupUntil
+        && A_TickCount < LlamaStartupUntil
+
+    ; A wrapper PID may not be observable immediately during process startup.
+    ; Never let that transient race cancel an active startup grace window.
     if LlamaPid
     && !ProcessExist(LlamaPid) {
         LlamaPid := 0
-        LlamaProbeSuppressed := true
+
+        if !InStartupGrace
+            LlamaProbeSuppressed := true
     }
 
 
@@ -4707,7 +4640,9 @@ UpdateLlamaState() {
     ;  KNOWN OFFLINE — NO AUTOMATIC HTTP PROBE
     ; --------------------------------------------------------
 
-    if LlamaProbeSuppressed && !Owned {
+    if LlamaProbeSuppressed
+    && !Owned
+    && !InStartupGrace {
         LlamaStartupUntil := 0
         LlamaState := "offline"
 
@@ -4739,24 +4674,28 @@ UpdateLlamaState() {
 
 
     ; --------------------------------------------------------
+    ;  STARTUP GRACE
+    ; --------------------------------------------------------
+
+    if Status != 200
+    && A_TickCount < LlamaStartupUntil {
+        LlamaState := "loading"
+        LlamaProbeSuppressed := false
+
+        ActiveLlamaStatus.Text := "◐ Loading"
+        ActiveLlamaStartButton.Enabled := false
+        ActiveLlamaRestartButton.Enabled := false
+        ActiveLlamaStopButton.Enabled := Owned
+
+        return false
+    }
+
+
+    ; --------------------------------------------------------
     ;  OFFLINE
     ; --------------------------------------------------------
 
     if Status = 0 {
-        if A_TickCount
-        < LlamaStartupUntil {
-            LlamaState := "loading"
-
-            ActiveLlamaStatus.Text :=
-                "◐ Loading"
-
-            ActiveLlamaStartButton.Enabled := false
-            ActiveLlamaRestartButton.Enabled := false
-            ActiveLlamaStopButton.Enabled := true
-
-            return false
-        }
-
         LlamaStartupUntil := 0
         LlamaState := "offline"
         LlamaProbeSuppressed := true
@@ -4891,15 +4830,22 @@ UpdateMcpState() {
     global McpProbeSuppressed
 
 
+    InStartupGrace :=
+        McpStartupUntil
+        && A_TickCount < McpStartupUntil
+
     if McpPid
     && !ProcessExist(McpPid) {
         McpPid := 0
-        McpProbeSuppressed := true
 
-        if IsObject(ActiveMcpConfig)
-        && !ActiveMcpConfig.External {
-            ActiveMcpConfig := 0
-            ActiveMcpDirectories := ""
+        if !InStartupGrace {
+            McpProbeSuppressed := true
+
+            if IsObject(ActiveMcpConfig)
+            && !ActiveMcpConfig.External {
+                ActiveMcpConfig := 0
+                ActiveMcpDirectories := ""
+            }
         }
     }
 
@@ -4939,7 +4885,8 @@ UpdateMcpState() {
     ; --------------------------------------------------------
 
     if McpProbeSuppressed
-    && !Owned {
+    && !Owned
+    && !InStartupGrace {
         McpStartupUntil := 0
         McpState := "offline"
         ActiveMcpStatus.Text := "○ Offline"
@@ -4973,23 +4920,30 @@ UpdateMcpState() {
 
 
     ; --------------------------------------------------------
-    ;  OFFLINE / LOADING
+    ;  STARTUP GRACE
+    ; --------------------------------------------------------
+
+    if Status = 0
+    && A_TickCount < McpStartupUntil {
+        McpState := "loading"
+        McpProbeSuppressed := false
+        ActiveMcpStatus.Text := "◐ Loading"
+        ActiveMcpName.Text := "Filesystem"
+
+        ActiveMcpEditButton.Enabled := false
+        ActiveMcpStartButton.Enabled := false
+        ActiveMcpRestartButton.Enabled := false
+        ActiveMcpStopButton.Enabled := Owned
+
+        return false
+    }
+
+
+    ; --------------------------------------------------------
+    ;  OFFLINE
     ; --------------------------------------------------------
 
     if Status = 0 {
-        if A_TickCount < McpStartupUntil {
-            McpState := "loading"
-            ActiveMcpStatus.Text := "◐ Loading"
-            ActiveMcpName.Text := "Filesystem"
-
-            ActiveMcpEditButton.Enabled := false
-            ActiveMcpStartButton.Enabled := false
-            ActiveMcpRestartButton.Enabled := false
-            ActiveMcpStopButton.Enabled := Owned
-
-            return false
-        }
-
         McpStartupUntil := 0
 
         ; If an external/runtime snapshot has disappeared, release it.
@@ -5269,6 +5223,14 @@ EnterActiveView(
     Sleep(50)
 }
 
+ForceControlPaint(Control) {
+    DllCall(
+        "user32\UpdateWindow",
+        "ptr", Control.Hwnd
+    )
+}
+
+
 ; ============================================================
 ;  ACTIVE LLAMA CONTROLS
 ; ============================================================
@@ -5287,16 +5249,30 @@ StartActiveLlama(*) {
 
     global FastPollRate
     global LlamaProbeSuppressed
+    global LlamaStartupUntil, LlamaStartupGrace
+    global LlamaState
 
 
     SetActivePollRate(
         FastPollRate
     )
 
-    ; Automatic probing is suspended while Offline. A deliberate Start gets
-    ; one probe so an independently-started server is detected before we
-    ; attempt to launch another process on the same endpoint.
+    ; Every deliberate start receives a fresh grace window before any probe
+    ; or validation can yield to the Active polling timer.
+    LlamaStartupUntil :=
+        A_TickCount
+        + LlamaStartupGrace
+
     LlamaProbeSuppressed := false
+    LlamaState := "loading"
+
+    ActiveLlamaStatus.Text :=
+        "◐ Starting"
+
+    ActiveLlamaStartButton.Enabled := false
+    ActiveLlamaRestartButton.Enabled := false
+    ActiveLlamaStopButton.Enabled := false
+    ForceControlPaint(ActiveLlamaStatus)
 
     DesiredServer := CreateServerRuntimeConfig(
         ActiveServerKey
@@ -5312,6 +5288,7 @@ StartActiveLlama(*) {
             "Icon!"
         )
 
+        LlamaStartupUntil := 0
         LlamaProbeSuppressed := true
         UpdateActiveState()
         return
@@ -5323,17 +5300,11 @@ StartActiveLlama(*) {
 
     if HealthURL != ""
     && HttpStatus(HealthURL, 200) != 0 {
+        LlamaStartupUntil := 0
         ActiveServerConfig := DesiredServer
         UpdateActiveState()
         return
     }
-
-    ActiveLlamaStatus.Text :=
-        "◐ Starting"
-
-    ActiveLlamaStartButton.Enabled := false
-    ActiveLlamaRestartButton.Enabled := false
-    ActiveLlamaStopButton.Enabled := false
 
     if StartLlama(
         ActiveModelKey,
@@ -5345,6 +5316,7 @@ StartActiveLlama(*) {
         RefreshActiveLlamaDetails()
     }
     else {
+        LlamaStartupUntil := 0
         LlamaProbeSuppressed := true
         UpdateActiveState()
     }
@@ -5522,12 +5494,24 @@ StartActiveMcp(*) {
     global ActiveMcpDirectories
     global ActiveMcpConfig
     global ActiveMcpStatus
+    global ActiveMcpStartButton
+    global ActiveMcpRestartButton
+    global ActiveMcpStopButton
     global McpStartupUntil, McpStartupGrace
     global McpProbeSuppressed
+    global McpState
     global FastPollRate
 
     SetActivePollRate(FastPollRate)
+
+    ; As with llama, establish startup intent before the first probe so the
+    ; polling timer can never collapse a deliberate start back to Offline.
+    McpStartupUntil :=
+        A_TickCount
+        + McpStartupGrace
+
     McpProbeSuppressed := false
+    McpState := "loading"
 
     Desired := GetSavedMcpConfig(
         ActiveModelKey
@@ -5542,11 +5526,18 @@ StartActiveMcp(*) {
         return
     }
 
+    ActiveMcpStatus.Text := "◐ Starting"
+    ActiveMcpStartButton.Enabled := false
+    ActiveMcpRestartButton.Enabled := false
+    ActiveMcpStopButton.Enabled := false
+    ForceControlPaint(ActiveMcpStatus)
+
     if HttpStatus(
         GetMcpStatusURL(
             Desired
         )
     ) != 0 {
+        McpStartupUntil := 0
         ActiveMcpConfig := CreateMcpRuntimeConfig(
             Desired,
             true,
@@ -5587,8 +5578,6 @@ StartActiveMcp(*) {
     McpStartupUntil :=
         A_TickCount
         + McpStartupGrace
-
-    ActiveMcpStatus.Text := "◐ Starting"
 
     try StartMcp(
         Desired
@@ -5897,10 +5886,11 @@ MergeMcpDirectories(DirectorySets*) {
 
 
 GetSavedMcpConfig(ModelKey := "") {
-    global McpEnabled, McpAddress, McpPort
+    global McpEnabled, McpProxyExecutable, McpAddress, McpPort
 
     return {
         Enabled: McpEnabled,
+        ProxyExecutable: Trim(McpProxyExecutable),
         Address: Trim(McpAddress),
         Port: McpPort + 0,
         Directories: GetEffectiveMcpDirectories(
@@ -5913,6 +5903,9 @@ GetSavedMcpConfig(ModelKey := "") {
 CreateMcpRuntimeConfig(Config, External := false, AccessKnown := true) {
     return {
         Enabled: Config.Enabled,
+        ProxyExecutable: Config.HasOwnProp("ProxyExecutable")
+            ? Trim(Config.ProxyExecutable)
+            : "",
         Address: Trim(Config.Address),
         Port: Config.Port + 0,
         Directories: Config.Directories,
@@ -5927,6 +5920,12 @@ McpCoreConfigsMatch(A, B) {
         return false
 
     if A.Enabled != B.Enabled
+        return false
+
+    AProxy := A.HasOwnProp("ProxyExecutable") ? Trim(A.ProxyExecutable) : ""
+    BProxy := B.HasOwnProp("ProxyExecutable") ? Trim(B.ProxyExecutable) : ""
+
+    if StrLower(AProxy) != StrLower(BProxy)
         return false
 
     if StrLower(Trim(A.Address)) != StrLower(Trim(B.Address))
@@ -6259,6 +6258,125 @@ DirectoriesFromEdit(Text) {
 }
 
 
+
+BrowseMcpDirectory(EditControl) {
+    Existing := DirectoriesFromEdit(
+        EditControl.Text
+    )
+
+    StartDirectory := ""
+
+    for Directory in StrSplit(Existing, "|") {
+        Directory := Trim(Directory)
+
+        if Directory != ""
+        && DirExist(Directory) {
+            StartDirectory := Directory
+            break
+        }
+    }
+
+    SelectedDirectory := DirSelect(
+        StartDirectory,
+        0,
+        "Select MCP directory"
+    )
+
+    if SelectedDirectory = ""
+        return
+
+    EditControl.Text := DirectoriesForEdit(
+        MergeMcpDirectories(
+            Existing,
+            SelectedDirectory
+        )
+    )
+}
+
+
+DiscoverMcpProxyExecutable() {
+    ; Prefer whatever the user/install manager has exposed on PATH.
+    Path := FindExecutableOnPath("mcp-proxy.exe")
+    if Path != ""
+        return Path
+
+    ; uv and pipx allow their executable directories to be overridden.
+    for VariableName in ["UV_TOOL_BIN_DIR", "PIPX_BIN_DIR"] {
+        BinDirectory := Trim(EnvGet(VariableName))
+
+        if BinDirectory = ""
+            continue
+
+        Candidate := RTrim(BinDirectory, "\/") "\mcp-proxy.exe"
+        if FileExist(Candidate)
+            return Candidate
+    }
+
+    ; Both uv tool and modern pipx commonly expose user tools here.
+    UserProfile := Trim(EnvGet("USERPROFILE"))
+    if UserProfile != "" {
+        Candidate := UserProfile "\.local\bin\mcp-proxy.exe"
+        if FileExist(Candidate)
+            return Candidate
+    }
+
+    ; pip --user installs commonly create PythonXY\Scripts beneath Roaming AppData.
+    PythonRoot := A_AppData "\Python"
+    if DirExist(PythonRoot) {
+        Loop Files PythonRoot "\Python*", "D" {
+            Candidate := A_LoopFileFullPath "\Scripts\mcp-proxy.exe"
+
+            if FileExist(Candidate)
+                return Candidate
+        }
+    }
+
+    return ""
+}
+
+
+FindExecutableOnPath(FileName) {
+    try {
+        Shell := ComObject(
+            "WScript.Shell"
+        )
+
+        Exec := Shell.Exec(
+            'where.exe "' FileName '"'
+        )
+
+        Output := Exec.StdOut.ReadAll()
+
+        for Line in StrSplit(Output, "`n") {
+            Candidate := Trim(Line)
+
+            if Candidate != ""
+            && FileExist(Candidate)
+                return Candidate
+        }
+    }
+
+    return ""
+}
+
+BrowseMcpProxyExecutable(EditControl) {
+    StartPath := Trim(EditControl.Text)
+
+    if StartPath = ""
+        StartPath := DiscoverMcpProxyExecutable()
+
+    SelectedPath := FileSelect(
+        1,
+        StartPath,
+        "Select mcp-proxy executable",
+        "mcp-proxy executable (mcp-proxy.exe)"
+    )
+
+    if SelectedPath != ""
+        EditControl.Text := SelectedPath
+}
+
+
 GetParentDirectory(FilePath) {
     SplitPath(
         FilePath,
@@ -6274,18 +6392,25 @@ GetParentDirectory(FilePath) {
 ; ============================================================
 
 ChooseCache(Control, Cache) {
-    switch Cache {
-        case "f16":
-            Control.Choose(1)
+    global KvCacheOptions
 
-        case "q8_0":
-            Control.Choose(2)
+    Cache := StrLower(
+        Trim(Cache)
+    )
 
-        case "q4_0":
-            Control.Choose(3)
+    for Index, Option in KvCacheOptions {
+        if Option = Cache {
+            Control.Choose(Index)
+            return
+        }
+    }
 
-        default:
-            Control.Choose(3)
+    ; q4_0 remains WinLlama's safe model default.
+    for Index, Option in KvCacheOptions {
+        if Option = "q4_0" {
+            Control.Choose(Index)
+            return
+        }
     }
 }
 
@@ -6657,7 +6782,7 @@ OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
     Editing := ServerKey != "" && Servers.Has(ServerKey)
     Server := Editing
         ? Servers[ServerKey]
-        : {Name: "", Executable: "", Address: "127.0.0.1", Port: 18080, Args: ""}
+        : {Name: "", Executable: "", Address: "127.0.0.1", Port: 8080, Args: ""}
 
     EditorGui := Gui(, Editing ? "Edit Llama Server" : "Add Llama Server")
     EditorGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
@@ -6672,11 +6797,11 @@ OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
 
     EditorGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
     EditorGui.AddText("x24 y70", "Name")
-    NameEdit := EditorGui.AddEdit("x24 y99 w480 Background" SecondaryColor " c" TextColor, Server.Name)
+    NameEdit := EditorGui.AddEdit("x24 y99 w480 r1 -Multi Background" SecondaryColor " c" TextColor, Server.Name)
 
     EditorGui.AddText("x24 y145", "Executable")
     ExecutableEdit := EditorGui.AddEdit(
-        "x24 y174 w438 Background" SecondaryColor " c" TextColor, Server.Executable
+        "x24 y174 w438 r1 -Multi Background" SecondaryColor " c" TextColor, Server.Executable
     )
 
     EditorGui.SetFont("s11 c" TextColor, "Segoe UI")
@@ -6687,14 +6812,14 @@ OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
     EditorGui.AddText("x24 y220", "Address")
     EditorGui.AddText("x374 y220", "Port")
     AddressEdit := EditorGui.AddEdit(
-        "x24 y249 w330 Background" SecondaryColor " c" TextColor, Server.Address
+        "x24 y249 w330 r1 -Multi Background" SecondaryColor " c" TextColor, Server.Address
     )
     PortEdit := EditorGui.AddEdit(
-        "x374 y249 w130 Number Background" SecondaryColor " c" TextColor, Server.Port
+        "x374 y249 w130 r1 -Multi Number Background" SecondaryColor " c" TextColor, Server.Port
     )
 
     EditorGui.AddText("x24 y295", "Optional arguments")
-    ArgsEdit := EditorGui.AddEdit("x24 y324 w480 Background" SecondaryColor " c" TextColor, Server.Args)
+    ArgsEdit := EditorGui.AddEdit("x24 y324 w480 r1 -Multi Background" SecondaryColor " c" TextColor, Server.Args)
 
     EditorGui.SetFont("s10 c" MutedColor, "Segoe UI")
     EditorGui.AddText(
@@ -6723,7 +6848,10 @@ OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
 
 BrowseServerExecutable(ExecutableEdit) {
     SelectedPath := FileSelect(
-        1, Trim(ExecutableEdit.Text), "Select llama-server executable", "Programs (*.exe)"
+        1,
+        Trim(ExecutableEdit.Text),
+        "Select llama-server executable",
+        "llama-server executable (llama-server.exe)"
     )
 
     if SelectedPath != ""
@@ -6856,7 +6984,7 @@ LoadServers() {
             Port: ConfigReadInteger(
                 Key,
                 "Port",
-                18080,
+                8080,
                 1,
                 65535
             ),
@@ -6929,7 +7057,7 @@ AddServer(
     Name,
     Executable,
     Address := "127.0.0.1",
-    Port := 18080,
+    Port := 8080,
     Args := ""
 ) {
     ServerKey :=
@@ -7225,6 +7353,8 @@ CleanupOwnedServices(ExitReason, ExitCode) {
     global LlamaPid, McpPid
     global InstanceMutex
 
+    SaveCurrentControllerWindowCenter()
+
     if LlamaPid && ProcessExist(LlamaPid)
         StopProcessTree(LlamaPid)
 
@@ -7255,7 +7385,112 @@ SetActivePollRate(Rate) {
     )
 }
 
+ShowStartupWindow() {
+    global MainGui
+    global SavedWindowCenterX, SavedWindowCenterY
+
+    if SavedWindowCenterX = ""
+    || SavedWindowCenterY = "" {
+        MainGui.Show("w572")
+        return
+    }
+
+    MainGui.Show("Hide w572")
+
+    Rect := Buffer(16)
+
+    DllCall(
+        "user32\GetWindowRect",
+        "ptr", MainGui.Hwnd,
+        "ptr", Rect
+    )
+
+    Width :=
+        NumGet(Rect, 8, "Int")
+        - NumGet(Rect, 0, "Int")
+
+    Height :=
+        NumGet(Rect, 12, "Int")
+        - NumGet(Rect, 4, "Int")
+
+    X := Round(SavedWindowCenterX - Width / 2)
+    Y := Round(SavedWindowCenterY - Height / 2)
+
+    ClampToDesktop(
+        &X,
+        &Y,
+        Width,
+        Height
+    )
+
+    DllCall(
+        "user32\SetWindowPos",
+        "ptr", MainGui.Hwnd,
+        "ptr", 0,
+        "int", X,
+        "int", Y,
+        "int", 0,
+        "int", 0,
+        "uint", 0x0001 | 0x0004
+    )
+
+    MainGui.Show()
+}
+
+
+SaveCurrentControllerWindowCenter() {
+    global ControllerMode
+    global MainGui, ActiveGui
+
+    if ControllerMode = "active"
+    && IsSet(ActiveGui)
+    && IsObject(ActiveGui) {
+        SaveControllerWindowCenter(ActiveGui)
+        return
+    }
+
+    if ControllerMode = "start"
+    && IsSet(MainGui)
+    && IsObject(MainGui)
+        SaveControllerWindowCenter(MainGui)
+}
+
+
+SaveControllerWindowCenter(GuiObj) {
+    global SavedWindowCenterX, SavedWindowCenterY
+
+    if !IsObject(GuiObj)
+        return
+
+    try {
+        Rect := Buffer(16)
+
+        DllCall(
+            "user32\GetWindowRect",
+            "ptr", GuiObj.Hwnd,
+            "ptr", Rect
+        )
+
+        Left := NumGet(Rect, 0, "Int")
+        Top := NumGet(Rect, 4, "Int")
+        Right := NumGet(Rect, 8, "Int")
+        Bottom := NumGet(Rect, 12, "Int")
+
+        SavedWindowCenterX := Round((Left + Right) / 2)
+        SavedWindowCenterY := Round((Top + Bottom) / 2)
+
+        ConfigWriteMany(
+            "State",
+            Map(
+                "WindowCenterX", SavedWindowCenterX,
+                "WindowCenterY", SavedWindowCenterY
+            )
+        )
+    }
+}
+
 HideController(GuiObj, *) {
+    SaveControllerWindowCenter(GuiObj)
     GuiObj.Hide()
 }
 
@@ -7355,7 +7590,7 @@ GetListeningPid(Port) {
 
         LocalAddress := Fields[2]
 
-        ; Make sure :18080 doesn't accidentally match :180800, etc.
+        ; Make sure :8080 doesn't accidentally match :80800, etc.
         if !RegExMatch(
             LocalAddress,
             ":" Port "$"
