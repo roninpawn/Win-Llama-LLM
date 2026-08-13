@@ -15,7 +15,7 @@ OnExit(CleanupOwnedServices)
 ; ============================================================
 
 AppName := "WinLlama LLM"
-AppVersion := "0.1.0"
+AppVersion := "1.0.0"
 AppWindowTitle := AppName " v" AppVersion
 
 ; ============================================================
@@ -98,8 +98,16 @@ McpProxyExecutable := ConfigRead(
     ""
 )
 
-if Trim(McpProxyExecutable) = ""
-    McpProxyExecutable := DiscoverMcpProxyExecutable()
+McpProxyAutoDiscovered := false
+
+if Trim(McpProxyExecutable) = "" {
+    DiscoveredMcpProxy := DiscoverMcpProxyExecutable()
+
+    if DiscoveredMcpProxy != "" {
+        McpProxyExecutable := DiscoveredMcpProxy
+        McpProxyAutoDiscovered := true
+    }
+}
 
 McpAddress := ConfigRead(
     "MCP",
@@ -110,7 +118,7 @@ McpAddress := ConfigRead(
 McpPort := ConfigReadInteger(
     "MCP",
     "Port",
-    8081,
+    9932,
     1,
     65535
 )
@@ -156,6 +164,39 @@ LogsDirectory := ResolvePath(
     )
 )
 
+EnsureLoggingDefaults()
+
+DefaultLogFlushInterval := 5000
+
+LogFlushInterval := ConfigReadInteger(
+    "Logging",
+    "FlushInterval",
+    DefaultLogFlushInterval
+)
+
+if LogFlushInterval <= 0
+    LogFlushInterval := DefaultLogFlushInterval
+
+LlamaLogSessions := ConfigReadInteger(
+    "Logging",
+    "LlamaSessions",
+    10
+)
+
+if LlamaLogSessions <= 0
+    LlamaLogSessions := 10
+
+McpLogSessions := ConfigReadInteger(
+    "Logging",
+    "McpSessions",
+    3
+)
+
+if McpLogSessions <= 0
+    McpLogSessions := 3
+
+CapturePollInterval := 50
+
 Servers := LoadServers()
 Models := LoadModels()
 NeedsSetup := ConfigurationNeedsSetup()
@@ -163,11 +204,26 @@ NeedsSetup := ConfigurationNeedsSetup()
 LlamaPid := 0
 McpPid := 0
 
-LlamaLog := LogsDirectory "\llama.log"
-McpLog := LogsDirectory "\mcp.log"
+LlamaLog := ""
+McpLog := ""
 
 if !DirExist(LogsDirectory)
     DirCreate(LogsDirectory)
+
+LogStreams := Map(
+    "llama", {FilePath: "", Buffer: "", Dirty: false},
+    "mcp",   {FilePath: "", Buffer: "", Dirty: false}
+)
+
+CapturedProcesses := Map()
+
+McpPollState := {
+    Active: false,
+    Additional: 0,
+    LatestRaw: "",
+    LatestDisplay: "",
+    ViewerTallyStart: 0
+}
 
 ControllerMode := "start"
 
@@ -216,11 +272,12 @@ ConsoleOutputWrap := 0
 
 ConsoleActiveTab := "llama"
 
-ConsoleLlamaPosition := 0
-ConsoleMcpPosition := 0
-
 ConsoleLlamaText := ""
 ConsoleMcpText := ""
+ConsoleLlamaRevision := 0
+ConsoleMcpRevision := 0
+ConsoleRenderedText := ""
+ConsoleRenderedRevision := -1
 
 ConsoleEffectiveRate := 250
 ConsoleRateCheckInterval := 250
@@ -234,6 +291,24 @@ DarkButtonFillOverrides := Map()
 
 SetupHostGui := 0
 SetupSelectedModelKey := ""
+
+SetTimer(
+    PollCapturedProcesses,
+    CapturePollInterval
+)
+
+try SetTimer(
+    FlushDirtyLogs,
+    LogFlushInterval
+)
+catch {
+    LogFlushInterval := DefaultLogFlushInterval
+
+    SetTimer(
+        FlushDirtyLogs,
+        LogFlushInterval
+    )
+}
 
 ; ============================================================
 ;  CONFIGURATION BOOTSTRAP
@@ -260,12 +335,59 @@ EnsureConfigFile() {
             "Enabled", "false",
             "ProxyExecutable", "",
             "Address", "127.0.0.1",
-            "Port", 8081,
+            "Port", 9932,
             "GlobalDirectories", ""
         )
     )
 
+    ConfigWriteMany(
+        "Logging",
+        Map(
+            "FlushInterval", 5000,
+            "LlamaSessions", 10,
+            "McpSessions", 3
+        )
+    )
+
     return true
+}
+
+
+EnsureLoggingDefaults() {
+    Missing := "__WINLLAMA_MISSING__"
+
+    if ConfigRead(
+        "Logging",
+        "FlushInterval",
+        Missing
+    ) = Missing
+        ConfigWrite(
+            "Logging",
+            "FlushInterval",
+            5000
+        )
+
+    if ConfigRead(
+        "Logging",
+        "LlamaSessions",
+        Missing
+    ) = Missing
+        ConfigWrite(
+            "Logging",
+            "LlamaSessions",
+            10
+        )
+
+    if ConfigRead(
+        "Logging",
+        "McpSessions",
+        Missing
+    ) = Missing
+        ConfigWrite(
+            "Logging",
+            "McpSessions",
+            3
+        )
 }
 
 
@@ -954,7 +1076,7 @@ MainGui.MarginY := 22
 ApplyDarkWindow(MainGui)
 
 MainGui.SetFont("s16 Bold c" TextColor, "Segoe UI")
-MainGui.AddText("xm w520 Center", "WINLLAMA LLM")
+MainGui.AddText("xm w520 Center", "WinLlama LLM")
 
 MainGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
 MainGui.AddText("xm y+24", "Model")
@@ -1838,7 +1960,7 @@ BuildActiveGui() {
 
     ActiveGui.AddText(
         "xm w520 Center",
-        "WINLLAMA LLM"
+        "WinLlama LLM"
     )
 
 
@@ -1933,7 +2055,7 @@ BuildActiveGui() {
 
     ActiveMcpName := ActiveGui.AddText(
         "x+8 yp w274 h30",
-        "Filesystem"
+        ""
     )
 
 	ActiveGui.SetFont("s11 c" TextColor, "Segoe UI")
@@ -2776,7 +2898,7 @@ OpenMcpEditor(*) {
 
 OpenMcpConfigEditor(ParentGui, AllowApply := false, SetupMode := false) {
     global McpEnabled, McpProxyExecutable, McpAddress, McpPort
-    global McpDirectories
+    global McpDirectories, McpProxyAutoDiscovered
     global BaseColor, TextColor
 
     EditorGui := Gui(
@@ -2810,12 +2932,17 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false, SetupMode := false) {
             : "MCP ACCESS"
     )
 
+    PanelMcpEnabled := McpEnabled
+
+    if SetupMode && McpProxyAutoDiscovered
+        PanelMcpEnabled := true
+
     McpPanel := McpConfigPanel(
         EditorGui,
         24,
         70,
         480,
-        McpEnabled,
+        PanelMcpEnabled,
         McpProxyExecutable,
         McpAddress,
         McpPort,
@@ -3118,6 +3245,973 @@ ApplySavedMcpConfiguration() {
 }
 
 ; ============================================================
+;  CAPTURED PROCESS / SESSION LOGGING
+; ============================================================
+
+BeginLogSession(Service) {
+    global LogsDirectory
+    global LlamaLogSessions, McpLogSessions
+    global LogStreams
+    global LlamaLog, McpLog
+    global ConsoleLlamaText, ConsoleMcpText
+    global ConsoleLlamaRevision, ConsoleMcpRevision
+    global McpPollState
+
+    SessionCount := Service = "llama"
+        ? LlamaLogSessions
+        : McpLogSessions
+
+    SlotKey := Service = "llama"
+        ? "LlamaLogSlot"
+        : "McpLogSlot"
+
+    Slot := ConfigReadInteger(
+        "State",
+        SlotKey,
+        0
+    ) + 1
+
+    if Slot < 1
+    || Slot > SessionCount
+        Slot := 1
+
+    ConfigWrite(
+        "State",
+        SlotKey,
+        Slot
+    )
+
+    FilePath := LogsDirectory
+        . "\"
+        . Service
+        . "-"
+        . Format("{:02}", Slot)
+        . ".log"
+
+    try {
+        File := FileOpen(
+            FilePath,
+            "w",
+            "UTF-8-RAW"
+        )
+
+        if IsObject(File)
+            File.Close()
+        else
+            FilePath := ""
+    }
+    catch {
+        FilePath := ""
+    }
+
+    LogStreams[Service] := {
+        FilePath: FilePath,
+        Buffer: "",
+        Dirty: false
+    }
+
+    if Service = "llama" {
+        LlamaLog := FilePath
+        ConsoleLlamaText := ""
+        ConsoleLlamaRevision += 1
+    }
+    else {
+        McpLog := FilePath
+        ConsoleMcpText := ""
+        ConsoleMcpRevision += 1
+
+        McpPollState := {
+            Active: false,
+            Additional: 0,
+            LatestRaw: "",
+            LatestDisplay: "",
+            ViewerTallyStart: 0
+        }
+    }
+
+    UpdateConsoleLogs()
+}
+
+QueueLogFile(
+    Service,
+    Text,
+    FlushNow := false
+) {
+    global LogStreams
+
+    if Text = ""
+        return
+
+    Stream := LogStreams[Service]
+
+    if Stream.FilePath = ""
+        return
+
+    Stream.Buffer .= Text
+    Stream.Dirty := true
+
+    if FlushNow
+        FlushLogService(Service)
+}
+
+FlushDirtyLogs(*) {
+    FlushLogService("llama")
+    FlushLogService("mcp")
+}
+
+FlushLogService(Service) {
+    global LogStreams
+
+    Stream := LogStreams[Service]
+
+    if !Stream.Dirty
+    || Stream.Buffer = ""
+        return true
+
+    if Stream.FilePath = "" {
+        Stream.Buffer := ""
+        Stream.Dirty := false
+        return false
+    }
+
+    ; Detach this batch from the live buffer before touching disk.
+    ; New pipe activity can safely accumulate behind it.
+    Text := Stream.Buffer
+    Stream.Buffer := ""
+    Stream.Dirty := false
+
+    try {
+        File := FileOpen(
+            Stream.FilePath,
+            "a",
+            "UTF-8-RAW"
+        )
+
+        if !IsObject(File)
+            throw Error("Could not open log file.")
+
+        File.Write(
+            Text
+        )
+
+        File.Close()
+        return true
+    }
+    catch {
+        ; Put the failed older batch back in front of anything newer.
+        Stream.Buffer := Text . Stream.Buffer
+        Stream.Dirty := true
+        return false
+    }
+}
+
+StartCapturedProcess(
+    Service,
+    Executable,
+    CommandLine,
+    WorkingDirectory
+) {
+    global CapturedProcesses
+
+    SaSize := A_PtrSize = 8
+        ? 24
+        : 12
+
+    SaInheritOffset := A_PtrSize = 8
+        ? 16
+        : 8
+
+    Security := Buffer(
+        SaSize,
+        0
+    )
+
+    NumPut(
+        "UInt",
+        SaSize,
+        Security,
+        0
+    )
+
+    NumPut(
+        "Int",
+        1,
+        Security,
+        SaInheritOffset
+    )
+
+    ReadBuffer := Buffer(
+        A_PtrSize,
+        0
+    )
+
+    WriteBuffer := Buffer(
+        A_PtrSize,
+        0
+    )
+
+    if !DllCall(
+        "Kernel32\CreatePipe",
+        "ptr", ReadBuffer.Ptr,
+        "ptr", WriteBuffer.Ptr,
+        "ptr", Security.Ptr,
+        "uint", 1048576,
+        "int"
+    )
+        throw Error(
+            "Could not create the process output pipe. Windows error "
+            . DllCall("Kernel32\GetLastError", "uint")
+            . "."
+        )
+
+    ReadHandle := NumGet(
+        ReadBuffer,
+        0,
+        "Ptr"
+    )
+
+    WriteHandle := NumGet(
+        WriteBuffer,
+        0,
+        "Ptr"
+    )
+
+    NulHandle := 0
+
+    try {
+        ; The controller's read end must remain private to the parent.
+        if !DllCall(
+            "Kernel32\SetHandleInformation",
+            "ptr", ReadHandle,
+            "uint", 0x1,
+            "uint", 0,
+            "int"
+        )
+            throw Error(
+                "Could not protect the process output pipe from inheritance."
+            )
+
+        NulHandle := DllCall(
+            "Kernel32\CreateFileW",
+            "wstr", "NUL",
+            "uint", 0x80000000,
+            "uint", 0x3,
+            "ptr", Security.Ptr,
+            "uint", 3,
+            "uint", 0x80,
+            "ptr", 0,
+            "ptr"
+        )
+
+        if NulHandle = -1
+            throw Error(
+                "Could not open the null input device for the child process."
+            )
+
+        SiSize := A_PtrSize = 8
+            ? 104
+            : 68
+
+        FlagsOffset := A_PtrSize = 8
+            ? 60
+            : 44
+
+        StdInputOffset := A_PtrSize = 8
+            ? 80
+            : 56
+
+        StdOutputOffset := StdInputOffset
+            + A_PtrSize
+
+        StdErrorOffset := StdOutputOffset
+            + A_PtrSize
+
+        StartupInfo := Buffer(
+            SiSize,
+            0
+        )
+
+        NumPut(
+            "UInt",
+            SiSize,
+            StartupInfo,
+            0
+        )
+
+        NumPut(
+            "UInt",
+            0x100,  ; STARTF_USESTDHANDLES
+            StartupInfo,
+            FlagsOffset
+        )
+
+        NumPut(
+            "Ptr",
+            NulHandle,
+            StartupInfo,
+            StdInputOffset
+        )
+
+        NumPut(
+            "Ptr",
+            WriteHandle,
+            StartupInfo,
+            StdOutputOffset
+        )
+
+        NumPut(
+            "Ptr",
+            WriteHandle,
+            StartupInfo,
+            StdErrorOffset
+        )
+
+        ProcessInfo := Buffer(
+            A_PtrSize * 2 + 8,
+            0
+        )
+
+        CommandBuffer := Buffer(
+            StrPut(
+                CommandLine,
+                "UTF-16"
+            ) * 2,
+            0
+        )
+
+        StrPut(
+            CommandLine,
+            CommandBuffer,
+            "UTF-16"
+        )
+
+        Success := DllCall(
+            "Kernel32\CreateProcessW",
+            "wstr", Executable,
+            "ptr", CommandBuffer.Ptr,
+            "ptr", 0,
+            "ptr", 0,
+            "int", true,
+            "uint", 0x08000000,  ; CREATE_NO_WINDOW
+            "ptr", 0,
+            "wstr", WorkingDirectory,
+            "ptr", StartupInfo.Ptr,
+            "ptr", ProcessInfo.Ptr,
+            "int"
+        )
+
+        if !Success
+            throw Error(
+                "Could not start the process. Windows error "
+                . DllCall("Kernel32\GetLastError", "uint")
+                . "."
+            )
+
+        ProcessHandle := NumGet(
+            ProcessInfo,
+            0,
+            "Ptr"
+        )
+
+        ThreadHandle := NumGet(
+            ProcessInfo,
+            A_PtrSize,
+            "Ptr"
+        )
+
+        Pid := NumGet(
+            ProcessInfo,
+            A_PtrSize * 2,
+            "UInt"
+        )
+
+        CloseWinHandle(
+            ProcessHandle
+        )
+
+        CloseWinHandle(
+            ThreadHandle
+        )
+    }
+    catch Error as Err {
+        CloseWinHandle(
+            ReadHandle
+        )
+
+        CloseWinHandle(
+            WriteHandle
+        )
+
+        CloseWinHandle(
+            NulHandle
+        )
+
+        throw Err
+    }
+
+    ; Parent keeps only the read end after process creation.
+    CloseWinHandle(
+        WriteHandle
+    )
+
+    CloseWinHandle(
+        NulHandle
+    )
+
+    if CapturedProcesses.Has(Service)
+        FinalizeCapturedProcess(
+            Service
+        )
+
+    BeginLogSession(
+        Service
+    )
+
+    CapturedProcesses[Service] := {
+        Pid: Pid,
+        ReadHandle: ReadHandle,
+        Partial: "",
+        Utf8Tail: []
+    }
+
+    ; Drain anything emitted during process creation immediately.
+    PollCapturedProcesses()
+
+    return Pid
+}
+
+CloseWinHandle(Handle) {
+    if !Handle
+    || Handle = -1
+        return
+
+    DllCall(
+        "Kernel32\CloseHandle",
+        "ptr", Handle
+    )
+}
+
+PollCapturedProcesses(*) {
+    global CapturedProcesses
+
+
+    for Service in ["llama", "mcp"] {
+        if !CapturedProcesses.Has(Service)
+            continue
+
+        State := CapturedProcesses[Service]
+
+        DrainCapturedPipe(
+            Service,
+            State
+        )
+
+        if !ProcessExist(State.Pid) {
+            ; Process termination may have left a final burst buffered.
+            DrainCapturedPipe(
+                Service,
+                State
+            )
+
+            FinalizeCapturedProcess(
+                Service
+            )
+        }
+    }
+}
+
+DrainCapturedPipe(
+    Service,
+    State
+) {
+    if !State.ReadHandle
+        return false
+
+    AvailableBuffer := Buffer(
+        4,
+        0
+    )
+
+    while true {
+        Success := DllCall(
+            "Kernel32\PeekNamedPipe",
+            "ptr", State.ReadHandle,
+            "ptr", 0,
+            "uint", 0,
+            "ptr", 0,
+            "ptr", AvailableBuffer.Ptr,
+            "ptr", 0,
+            "int"
+        )
+
+        if !Success
+            return false
+
+        Available := NumGet(
+            AvailableBuffer,
+            0,
+            "UInt"
+        )
+
+        if !Available
+            return true
+
+        ReadSize := Min(
+            Available,
+            65536
+        )
+
+        Data := Buffer(
+            ReadSize,
+            0
+        )
+
+        BytesReadBuffer := Buffer(
+            4,
+            0
+        )
+
+        if !DllCall(
+            "Kernel32\ReadFile",
+            "ptr", State.ReadHandle,
+            "ptr", Data.Ptr,
+            "uint", ReadSize,
+            "ptr", BytesReadBuffer.Ptr,
+            "ptr", 0,
+            "int"
+        )
+            return false
+
+        BytesRead := NumGet(
+            BytesReadBuffer,
+            0,
+            "UInt"
+        )
+
+        if !BytesRead
+            return true
+
+        Text := DecodeCapturedUtf8(
+            State,
+            Data,
+            BytesRead
+        )
+
+        if Text != ""
+            ProcessCapturedText(
+                Service,
+                State,
+                Text
+            )
+    }
+}
+
+DecodeCapturedUtf8(
+    State,
+    Data,
+    Length
+) {
+    TailLength := State.Utf8Tail.Length
+    TotalLength := TailLength + Length
+
+    Combined := Buffer(
+        TotalLength,
+        0
+    )
+
+    for Index, Byte in State.Utf8Tail {
+        NumPut(
+            "UChar",
+            Byte,
+            Combined,
+            Index - 1
+        )
+    }
+
+    if Length {
+        DllCall(
+            "Kernel32\RtlMoveMemory",
+            "ptr", Combined.Ptr + TailLength,
+            "ptr", Data.Ptr,
+            "uptr", Length
+        )
+    }
+
+    CompleteLength := GetCompleteUtf8PrefixLength(
+        Combined,
+        TotalLength
+    )
+
+    State.Utf8Tail := []
+
+    Loop TotalLength - CompleteLength {
+        State.Utf8Tail.Push(
+            NumGet(
+                Combined,
+                CompleteLength + A_Index - 1,
+                "UChar"
+            )
+        )
+    }
+
+    if !CompleteLength
+        return ""
+
+    return StrGet(
+        Combined.Ptr,
+        CompleteLength,
+        "UTF-8"
+    )
+}
+
+GetCompleteUtf8PrefixLength(
+    Data,
+    Length
+) {
+    if Length <= 0
+        return 0
+
+    Index := Length - 1
+
+    while Index >= 0 {
+        Byte := NumGet(
+            Data,
+            Index,
+            "UChar"
+        )
+
+        if (Byte & 0xC0) != 0x80
+            break
+
+        Index -= 1
+    }
+
+    if Index < 0
+        return Length
+
+    Lead := NumGet(
+        Data,
+        Index,
+        "UChar"
+    )
+
+    if Lead < 0x80
+        Expected := 1
+    else if Lead >= 0xC2
+    && Lead <= 0xDF
+        Expected := 2
+    else if Lead >= 0xE0
+    && Lead <= 0xEF
+        Expected := 3
+    else if Lead >= 0xF0
+    && Lead <= 0xF4
+        Expected := 4
+    else
+        return Length
+
+    Actual := Length - Index
+
+    return Actual < Expected
+        ? Index
+        : Length
+}
+
+ProcessCapturedText(
+    Service,
+    State,
+    Text
+) {
+    State.Partial .= Text
+
+    while Newline := InStr(
+        State.Partial,
+        "`n"
+    ) {
+        Record := SubStr(
+            State.Partial,
+            1,
+            Newline
+        )
+
+        State.Partial := SubStr(
+            State.Partial,
+            Newline + 1
+        )
+
+        ProcessCapturedRecord(
+            Service,
+            Record
+        )
+    }
+}
+
+ProcessCapturedRecord(
+    Service,
+    RawRecord
+) {
+    DisplayRecord := StripAnsi(
+        RawRecord
+    )
+
+    if Service = "mcp" {
+        if IsMcpPollingRecord(
+            DisplayRecord
+        ) {
+            ProcessMcpPollingRecord(
+                RawRecord,
+                DisplayRecord
+            )
+
+            return
+        }
+
+        FinalizeMcpPollingTally()
+    }
+
+    QueueLogFile(
+        Service,
+        RawRecord
+    )
+
+    AppendLogViewerText(
+        Service,
+        DisplayRecord
+    )
+}
+
+AppendLogViewerText(
+    Service,
+    Text
+) {
+    global ConsoleLlamaText, ConsoleMcpText
+    global ConsoleLlamaRevision, ConsoleMcpRevision
+
+    if Service = "llama" {
+        ConsoleLlamaText .= Text
+        ConsoleLlamaRevision += 1
+    }
+    else {
+        ConsoleMcpText .= Text
+        ConsoleMcpRevision += 1
+    }
+}
+
+IsMcpPollingRecord(Text) {
+    Clean := Trim(
+        Text,
+        "`r`n"
+    )
+
+    return RegExMatch(
+        Clean,
+        '^INFO:\s+\S+:\d+\s+-\s+"GET /status HTTP/1\.1"\s+200 OK$'
+    )
+}
+
+ProcessMcpPollingRecord(
+    RawRecord,
+    DisplayRecord
+) {
+    global McpPollState
+    global ConsoleMcpText
+    global ConsoleMcpRevision
+
+    if !McpPollState.Active {
+        McpPollState.Active := true
+        McpPollState.Additional := 0
+        McpPollState.LatestRaw := RawRecord
+        McpPollState.LatestDisplay := DisplayRecord
+        McpPollState.ViewerTallyStart := 0
+
+        ; Persist the first poll immediately. If WinLlama crashes during
+        ; a long idle run, the log still proves MCP was recently healthy.
+        QueueLogFile(
+            "mcp",
+            RawRecord,
+            true
+        )
+
+        ConsoleMcpText .= DisplayRecord
+        ConsoleMcpRevision += 1
+        return
+    }
+
+    McpPollState.Additional += 1
+    McpPollState.LatestRaw := RawRecord
+    McpPollState.LatestDisplay := DisplayRecord
+
+    Tally := AddPollingMultiplier(
+        DisplayRecord,
+        McpPollState.Additional
+    )
+
+    if McpPollState.Additional = 1 {
+        McpPollState.ViewerTallyStart :=
+            StrLen(ConsoleMcpText) + 1
+
+        ConsoleMcpText .= Tally
+        ConsoleMcpRevision += 1
+        return
+    }
+
+    ConsoleMcpText := SubStr(
+        ConsoleMcpText,
+        1,
+        McpPollState.ViewerTallyStart - 1
+    ) . Tally
+
+    ConsoleMcpRevision += 1
+}
+
+FinalizeMcpPollingTally() {
+    global McpPollState
+
+    if !McpPollState.Active
+        return
+
+    if McpPollState.Additional > 0 {
+        QueueLogFile(
+            "mcp",
+            AddPollingMultiplier(
+                McpPollState.LatestRaw,
+                McpPollState.Additional
+            )
+        )
+    }
+
+    McpPollState.Active := false
+    McpPollState.Additional := 0
+    McpPollState.LatestRaw := ""
+    McpPollState.LatestDisplay := ""
+    McpPollState.ViewerTallyStart := 0
+}
+
+AddPollingMultiplier(
+    Text,
+    Count
+) {
+    Ending := ""
+    Body := Text
+
+    if SubStr(Body, -1) = "`n" {
+        Ending := "`n"
+        Body := SubStr(
+            Body,
+            1,
+            -1
+        )
+
+        if SubStr(Body, -1) = "`r" {
+            Ending := "`r`n"
+            Body := SubStr(
+                Body,
+                1,
+                -1
+            )
+        }
+    }
+
+    return Body
+        . " (x"
+        . Count
+        . ")"
+        . Ending
+}
+
+FinalizeCapturedProcess(Service) {
+    global CapturedProcesses
+
+    if !CapturedProcesses.Has(Service)
+        return
+
+    State := CapturedProcesses[Service]
+
+    DrainCapturedPipe(
+        Service,
+        State
+    )
+
+    if State.Utf8Tail.Length {
+        Tail := Buffer(
+            State.Utf8Tail.Length,
+            0
+        )
+
+        for Index, Byte in State.Utf8Tail {
+            NumPut(
+                "UChar",
+                Byte,
+                Tail,
+                Index - 1
+            )
+        }
+
+        State.Partial .= StrGet(
+            Tail.Ptr,
+            Tail.Size,
+            "UTF-8"
+        )
+
+        State.Utf8Tail := []
+    }
+
+    if State.Partial != "" {
+        ProcessCapturedRecord(
+            Service,
+            State.Partial
+        )
+
+        State.Partial := ""
+    }
+
+    if Service = "mcp"
+        FinalizeMcpPollingTally()
+
+    CloseWinHandle(
+        State.ReadHandle
+    )
+
+    CapturedProcesses.Delete(
+        Service
+    )
+
+    ; A normal stop/restart should leave a complete session on disk.
+    FlushLogService(
+        Service
+    )
+
+    UpdateConsoleLogs()
+}
+
+FinalizeCapturedProcessByPid(Pid) {
+    global CapturedProcesses
+
+    for Service in ["llama", "mcp"] {
+        if CapturedProcesses.Has(Service)
+        && CapturedProcesses[Service].Pid = Pid {
+            FinalizeCapturedProcess(
+                Service
+            )
+
+            return
+        }
+    }
+}
+
+FinalizeAllCapturedProcesses() {
+    global CapturedProcesses
+
+    for Service in ["llama", "mcp"] {
+        if CapturedProcesses.Has(Service)
+            FinalizeCapturedProcess(
+                Service
+            )
+    }
+
+    FlushDirtyLogs()
+}
+
+; ============================================================
 ;  CONSOLE VIEWER
 ; ============================================================
 
@@ -3125,10 +4219,10 @@ OpenConsoleViewer(*) {
     global ConsoleGui
     global ConsoleActiveTab
 
-    global ConsoleLlamaPosition
-    global ConsoleMcpPosition
     global ConsoleLlamaText
     global ConsoleMcpText
+    global ConsoleRenderedText
+    global ConsoleRenderedRevision
 
 	global ConsoleMinRate
 	global ConsoleMaxRate
@@ -3180,11 +4274,8 @@ OpenConsoleViewer(*) {
 
     ConsoleActiveTab := "llama"
 
-    ConsoleLlamaPosition := 0
-    ConsoleMcpPosition := 0
-
-    ConsoleLlamaText := ""
-    ConsoleMcpText := ""
+    ConsoleRenderedText := ""
+    ConsoleRenderedRevision := -1
 	
 	ConsoleEffectiveRate :=
 		ConfigReadInteger(
@@ -3357,7 +4448,7 @@ OpenConsoleViewer(*) {
     UpdateConsoleTabAppearance()
 	UpdateConsoleWrapAppearance()
 
-    ; Load whatever is already in both logs immediately.
+    ; Render the current in-memory sessions immediately.
     UpdateConsoleLogs()
 
     SetTimer(
@@ -3385,19 +4476,27 @@ OpenConsoleViewer(*) {
 SelectConsoleTab(Tab) {
     global ConsoleActiveTab
     global ConsoleOutput
+    global ConsoleRenderedText
+    global ConsoleRenderedRevision
 
     global ConsoleLlamaText
     global ConsoleMcpText
+    global ConsoleLlamaRevision, ConsoleMcpRevision
 
     if ConsoleActiveTab = Tab
         return
 
     ConsoleActiveTab := Tab
 
-    if Tab = "llama"
-        ConsoleOutput.Value := ConsoleLlamaText
-    else
-        ConsoleOutput.Value := ConsoleMcpText
+    Text := Tab = "llama"
+        ? ConsoleLlamaText
+        : ConsoleMcpText
+
+    ConsoleOutput.Value := Text
+    ConsoleRenderedText := Text
+    ConsoleRenderedRevision := Tab = "llama"
+        ? ConsoleLlamaRevision
+        : ConsoleMcpRevision
 
     UpdateConsoleTabAppearance()
     ScrollConsoleToBottom()
@@ -3485,9 +4584,12 @@ RebuildConsoleOutput() {
     global ConsoleOutputWrap
     global ConsoleWrapEnabled
     global ConsoleActiveTab
+    global ConsoleRenderedText
+    global ConsoleRenderedRevision
 
     global ConsoleLlamaText
     global ConsoleMcpText
+    global ConsoleLlamaRevision, ConsoleMcpRevision
 
 
     Text :=
@@ -3503,6 +4605,10 @@ RebuildConsoleOutput() {
         : ConsoleOutputNoWrap
 
     ConsoleOutput.Value := Text
+    ConsoleRenderedText := Text
+    ConsoleRenderedRevision := ConsoleActiveTab = "llama"
+        ? ConsoleLlamaRevision
+        : ConsoleMcpRevision
 
     if IsObject(OldOutput)
         OldOutput.Visible := false
@@ -3538,106 +4644,114 @@ UpdateConsoleWrapAppearance() {
 }
 
 UpdateConsoleLogs(*) {
-    global LlamaLog
-    global McpLog
-
-    global ConsoleLlamaPosition
-    global ConsoleMcpPosition
-
-    global ConsoleLlamaText
-    global ConsoleMcpText
-
+    global ConsoleGui
     global ConsoleActiveTab
+    global ConsoleRenderedText
+    global ConsoleRenderedRevision
+    global ConsoleLlamaText, ConsoleMcpText
+    global ConsoleLlamaRevision, ConsoleMcpRevision
 
+    if !IsObject(ConsoleGui)
+        return
 
-    ; --------------------------------------------------------
-    ;  LLAMA
-    ; --------------------------------------------------------
+    if ConsoleActiveTab = "llama" {
+        Text := ConsoleLlamaText
+        Revision := ConsoleLlamaRevision
+    }
+    else {
+        Text := ConsoleMcpText
+        Revision := ConsoleMcpRevision
+    }
 
-    LlamaNew := ReadLogDelta(
-        LlamaLog,
-        &ConsoleLlamaPosition
+    if Revision = ConsoleRenderedRevision
+        return
+
+    RenderedLength := StrLen(
+        ConsoleRenderedText
     )
 
-    if LlamaNew != "" {
-        ConsoleLlamaText .= LlamaNew
-
-        if ConsoleActiveTab = "llama"
-            AppendConsoleText(
-                LlamaNew
-            )
-    }
-
-
-    ; --------------------------------------------------------
-    ;  MCP
-    ; --------------------------------------------------------
-
-	McpNew := ReadLogDelta(
-		McpLog,
-		&ConsoleMcpPosition
-	)
-
-	McpNew := FilterMcpPolling(
-		McpNew
-	)
-
-    if McpNew != "" {
-        ConsoleMcpText .= McpNew
-
-        if ConsoleActiveTab = "mcp"
-            AppendConsoleText(
-                McpNew
-            )
-    }
-}
-
-FilterMcpPolling(Text) {
-    return RegExReplace(
+    ; Most updates are append-only. Preserve the existing fast append
+    ; path and its tail-follow behavior whenever possible.
+    if RenderedLength <= StrLen(Text)
+    && SubStr(
         Text,
-        'm)^INFO:\s+\S+:\d+\s+-\s+"GET /status HTTP/1\.1"\s+200 OK\r?\n?'
-    )
-}
-
-ReadLogDelta(
-    FilePath,
-    &Position
-) {
-    if !FileExist(FilePath)
-        return ""
-
-    try {
-        File := FileOpen(
-            FilePath,
-            "r",
-            "UTF-8"
+        1,
+        RenderedLength
+    ) = ConsoleRenderedText {
+        AppendConsoleText(
+            SubStr(
+                Text,
+                RenderedLength + 1
+            )
         )
-
-        if !IsObject(File)
-            return ""
-
-
-        ; If the logfile was externally truncated or replaced,
-        ; start again from its beginning.
-        if File.Length < Position
-            Position := 0
-
-        File.Pos := Position
-
-        Text := File.Read()
-
-        Position := File.Pos
-
-        File.Close()
-
-        return StripAnsi(
+    }
+    else {
+        ; MCP's polling tally rewrites its final display line. A full
+        ; replacement is rare and preserves the reader's viewport.
+        ReplaceConsoleText(
             Text
         )
     }
-    catch {
-        return ""
+
+    ConsoleRenderedText := Text
+    ConsoleRenderedRevision := Revision
+}
+
+
+ReplaceConsoleText(Text) {
+    global ConsoleOutput
+
+    static EM_GETFIRSTVISIBLELINE := 0x00CE
+    static EM_LINESCROLL := 0x00B6
+
+    FollowTail := ConsoleIsAtBottom()
+
+    if !FollowTail {
+        FirstVisibleBefore := DllCall(
+            "user32\SendMessageW",
+            "ptr", ConsoleOutput.Hwnd,
+            "uint", EM_GETFIRSTVISIBLELINE,
+            "ptr", 0,
+            "ptr", 0
+        )
+    }
+
+    ConsoleOutput.Value := Text
+
+    if FollowTail {
+        ScrollConsoleToBottom()
+        return
+    }
+
+    FirstVisibleAfter := DllCall(
+        "user32\SendMessageW",
+        "ptr", ConsoleOutput.Hwnd,
+        "uint", EM_GETFIRSTVISIBLELINE,
+        "ptr", 0,
+        "ptr", 0
+    )
+
+    LineDifference :=
+        FirstVisibleBefore
+        - FirstVisibleAfter
+
+    if LineDifference {
+        DllCall(
+            "user32\SendMessageW",
+            "ptr", ConsoleOutput.Hwnd,
+            "uint", EM_LINESCROLL,
+            "ptr", 0,
+            "ptr", LineDifference
+        )
     }
 }
+
+
+
+
+
+
+
 
 ; ============================================================
 ;  CONSOLE DISPLAY
@@ -4003,7 +5117,12 @@ StopProcessTree(Pid) {
         ,
         "Hide"
     )
+
+    FinalizeCapturedProcessByPid(
+        Pid
+    )
 }
+
 
 ; ============================================================
 ;  LAUNCH
@@ -4237,7 +5356,6 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
 
 StartMcp(Config) {
     global McpPid
-    global McpLog
     global ActiveMcpConfig
     global ActiveMcpDirectories
     global McpStartupUntil, McpStartupGrace
@@ -4275,23 +5393,15 @@ StartMcp(Config) {
         . "mcp-server-filesystem"
         . DirectoryArgs
 
-    Command :=
-        A_ComSpec
-        . ' /d /s /c "'
-        . McpCommand
-        . ' >> "'
-        . McpLog
-        . '" 2>&1"'
-
     McpStartupUntil :=
         A_TickCount
         + McpStartupGrace
 
-    Run(
-        Command,
-        A_ScriptDir,
-        "Hide",
-        &McpPid
+    McpPid := StartCapturedProcess(
+        "mcp",
+        ProxyExecutable,
+        McpCommand,
+        A_ScriptDir
     )
 
     ActiveMcpDirectories := Config.Directories
@@ -4314,7 +5424,6 @@ StartLlama(
     global Models
 
     global LlamaPid
-    global LlamaLog
 
     global LlamaStartupUntil
     global LlamaStartupGrace
@@ -4442,21 +5551,13 @@ StartLlama(
     ;  LAUNCH
     ; --------------------------------------------------------
 
-    Command :=
-        A_ComSpec
-        . ' /d /s /c "'
-        . ServerCommand
-        . ' >> "'
-        . LlamaLog
-        . '" 2>&1"'
-
-    Run(
-        Command,
+    LlamaPid := StartCapturedProcess(
+        "llama",
+        Server.Executable,
+        ServerCommand,
         GetParentDirectory(
             Server.Executable
-        ),
-        "Hide",
-        &LlamaPid
+        )
     )
 
     SaveLastModel(
@@ -4890,7 +5991,10 @@ UpdateMcpState() {
         McpStartupUntil := 0
         McpState := "offline"
         ActiveMcpStatus.Text := "○ Offline"
-        ActiveMcpName.Text := "Filesystem"
+        ActiveMcpName.Text :=
+			GetMcpClientURL(
+				Desired
+			)
         ActiveMcpDetails.Text := DisplayDirectories(
             Desired.Directories
         )
@@ -4928,7 +6032,10 @@ UpdateMcpState() {
         McpState := "loading"
         McpProbeSuppressed := false
         ActiveMcpStatus.Text := "◐ Loading"
-        ActiveMcpName.Text := "Filesystem"
+        ActiveMcpName.Text :=
+			GetMcpClientURL(
+				Runtime
+			)
 
         ActiveMcpEditButton.Enabled := false
         ActiveMcpStartButton.Enabled := false
@@ -4967,7 +6074,10 @@ UpdateMcpState() {
             ? "! Offline"
             : "○ Offline"
 
-        ActiveMcpName.Text := "Filesystem"
+        ActiveMcpName.Text :=
+			GetMcpClientURL(
+				Runtime
+			)
 
         Details := DisplayDirectories(
             Owned
@@ -5050,7 +6160,10 @@ UpdateMcpState() {
 
     McpState := "online"
     ActiveMcpStatus.Text := "● Online"
-    ActiveMcpName.Text := "Filesystem"
+    ActiveMcpName.Text :=
+		GetMcpClientURL(
+			Runtime
+		)
 
     Details := DisplayDirectories(
         ActiveMcpDirectories
@@ -5187,7 +6300,10 @@ EnterActiveView(
 
         McpState := "loading"
         ActiveMcpStatus.Text := "◐ Starting"
-        ActiveMcpName.Text := "Filesystem"
+		ActiveMcpName.Text :=
+			GetMcpClientURL(
+				DesiredMcp
+			)
         ActiveMcpDetails.Text := DisplayDirectories(
             DesiredMcp.Directories
         )
@@ -6022,6 +7138,12 @@ GetMcpStatusURL(Config) {
         . "/status"
 }
 
+GetMcpClientURL(Config) {
+    return GetMcpBaseURL(
+        Config
+    )
+        . "/sse"
+}
 
 GetMcpEndpointLabel(Config) {
     Host := GetMcpCommandHost(
@@ -6271,7 +7393,9 @@ BrowseMcpDirectory(EditControl) {
 
         if Directory != ""
         && DirExist(Directory) {
-            StartDirectory := Directory
+            ; The * keeps this directory selected initially while allowing
+            ; navigation upward through its parents and the wider tree.
+            StartDirectory := "*" Directory
             break
         }
     }
@@ -6782,7 +7906,7 @@ OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
     Editing := ServerKey != "" && Servers.Has(ServerKey)
     Server := Editing
         ? Servers[ServerKey]
-        : {Name: "", Executable: "", Address: "127.0.0.1", Port: 8080, Args: ""}
+        : {Name: "", Executable: "", Address: "127.0.0.1", Port: 9931, Args: ""}
 
     EditorGui := Gui(, Editing ? "Edit Llama Server" : "Add Llama Server")
     EditorGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
@@ -6984,7 +8108,7 @@ LoadServers() {
             Port: ConfigReadInteger(
                 Key,
                 "Port",
-                8080,
+                9931,
                 1,
                 65535
             ),
@@ -7057,7 +8181,7 @@ AddServer(
     Name,
     Executable,
     Address := "127.0.0.1",
-    Port := 8080,
+    Port := 9931,
     Args := ""
 ) {
     ServerKey :=
@@ -7361,6 +8485,8 @@ CleanupOwnedServices(ExitReason, ExitCode) {
     if McpPid && ProcessExist(McpPid)
         StopProcessTree(McpPid)
 
+    FinalizeAllCapturedProcesses()
+
     if InstanceMutex {
         DllCall(
             "Kernel32\CloseHandle",
@@ -7370,6 +8496,7 @@ CleanupOwnedServices(ExitReason, ExitCode) {
         InstanceMutex := 0
     }
 }
+
 
 SetActivePollRate(Rate) {
     global ActivePollRate
@@ -7590,7 +8717,7 @@ GetListeningPid(Port) {
 
         LocalAddress := Fields[2]
 
-        ; Make sure :8080 doesn't accidentally match :80800, etc.
+        ; Make sure :PORT doesn't accidentally match a longer port number.
         if !RegExMatch(
             LocalAddress,
             ":" Port "$"
