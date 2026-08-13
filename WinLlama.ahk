@@ -162,6 +162,7 @@ ActiveHasLaunched := false
 
 ActiveModelKey := ""
 ActiveServerKey := ""
+ActiveServerConfig := 0
 ActiveContext := 0
 ActiveCache := ""
 ActiveModelMcpDirectories := ""
@@ -2025,22 +2026,48 @@ ApplyModelConfig(EditorGui, ModelPanel) {
     global ActiveGui
     global ActiveModelKey
     global ActiveServerKey
+    global ActiveServerConfig
     global ActiveContext
     global ActiveCache
     global ActiveModelMcpDirectories
     global LlamaPid
     global LlamaState
+    global Models
 
     Values := ModelPanel.GetValues()
 
     if !Values
         return
 
+    DesiredServer := CreateServerRuntimeConfig(
+        Values.ServerKey
+    )
+
+    if !DesiredServer {
+        MsgBox(
+            "The selected model references an unregistered llama server:`n`n"
+            . Values.ServerKey,
+            "Model Settings",
+            "Icon!"
+        )
+
+        return
+    }
+
+    ServerDefinitionChanged :=
+        Values.ServerKey = ActiveServerKey
+        && IsObject(ActiveServerConfig)
+        && !SameServerRuntimeConfig(
+            ActiveServerConfig,
+            DesiredServer
+        )
+
     LlamaChanged :=
         Values.ModelKey != ActiveModelKey
         || Values.ServerKey != ActiveServerKey
         || Values.Context != ActiveContext
         || Values.Cache != ActiveCache
+        || ServerDefinitionChanged
 
     McpRootsChanged := !SameDirectories(
         Values.McpDirectories,
@@ -2061,25 +2088,48 @@ ApplyModelConfig(EditorGui, ModelPanel) {
         return
     }
 
+    if (LlamaChanged || StartNeeded)
+    && !FileExist(DesiredServer.Executable) {
+        MsgBox(
+            "Llama server executable not found:`n`n"
+            . DesiredServer.Executable,
+            "Model Settings",
+            "Icon!"
+        )
+
+        return
+    }
+
+    if (LlamaChanged || StartNeeded)
+    && Models.Has(Values.ModelKey)
+    && !FileExist(Models[Values.ModelKey].Model) {
+        MsgBox(
+            "Model not found:`n`n"
+            . Models[Values.ModelKey].Model,
+            "Model Settings",
+            "Icon!"
+        )
+
+        return
+    }
+
     OldHealthURL := ""
     Status := 0
+    Owned :=
+        LlamaPid
+        && ProcessExist(LlamaPid)
 
-    ; When the active model is already known Offline, don't probe the old
-    ; endpoint just to prove it again. Apply will start the selected model.
+    ; When changing an active llama configuration, probe the endpoint the
+    ; current session actually uses — not the mutable server registry entry.
     if LlamaChanged && !StartNeeded {
-        OldHealthURL := GetModelHealthURL(
-            ActiveModelKey,
-            ActiveServerKey
+        OldHealthURL := GetServerHealthURL(
+            ActiveServerConfig
         )
 
         Status :=
             OldHealthURL != ""
                 ? HttpStatus(OldHealthURL)
                 : 0
-
-        Owned :=
-            LlamaPid
-            && ProcessExist(LlamaPid)
 
         if Status != 0 && !Owned {
             MsgBox(
@@ -2108,18 +2158,19 @@ ApplyModelConfig(EditorGui, ModelPanel) {
         ActiveGui
     )
 
-    if LlamaChanged && Status != 0 {
+    if LlamaChanged && Owned {
         RestartLlamaWithOfflineURL(
             OldHealthURL
         )
     }
-    else if StartNeeded {
+    else if LlamaChanged || StartNeeded {
         StartActiveLlama()
     }
     else {
         UpdateActiveState()
     }
 }
+
 
 SaveModelEditorDefaults(ModelPanel) {
     Values := ModelPanel.GetValues()
@@ -4094,6 +4145,7 @@ UpdateLlamaState() {
 
     global ActiveModelKey
     global ActiveServerKey
+    global ActiveServerConfig
     global ActiveContext
     global ActiveCache
 
@@ -4131,16 +4183,14 @@ UpdateLlamaState() {
     Model :=
         Models[ActiveModelKey]
 
-    Server := GetServer(
-        ActiveServerKey
-    )
+    Server := ActiveServerConfig
 
 
     ; --------------------------------------------------------
-    ;  INVALID SERVER REFERENCE
+    ;  NO ACTIVE SERVER SNAPSHOT
     ; --------------------------------------------------------
 
-    if !Server {
+    if !IsObject(Server) {
         LlamaStartupUntil := 0
         LlamaState := "offline"
         LlamaProbeSuppressed := true
@@ -4183,15 +4233,7 @@ UpdateLlamaState() {
 
         ActiveLlamaStatus.Text := "○ Offline"
         ActiveLlamaName.Text := Model.Name
-
-        ActiveLlamaDetails.Text :=
-            ActiveContext
-            . " context  •  "
-            . ActiveCache
-            . " KV  •  "
-            . Server.Name
-            . "  •  Port "
-            . Server.Port
+        ActiveLlamaDetails.Text := GetActiveLlamaDetails()
 
         ActiveLlamaEditButton.Enabled := true
         ActiveLlamaStartButton.Enabled := true
@@ -4202,13 +4244,9 @@ UpdateLlamaState() {
     }
 
 
-    WebUI :=
-        GetServerWebUI(
-            Server
-        )
-
-    HealthURL :=
-        WebUI "/health"
+    HealthURL := GetServerHealthURL(
+        Server
+    )
 
     Status :=
         HttpStatus(
@@ -4249,14 +4287,7 @@ UpdateLlamaState() {
         ActiveLlamaName.Text :=
             Model.Name
 
-        ActiveLlamaDetails.Text :=
-            ActiveContext
-            . " context  •  "
-            . ActiveCache
-            . " KV  •  "
-            . Server.Name
-            . "  •  Port "
-            . Server.Port
+        ActiveLlamaDetails.Text := GetActiveLlamaDetails()
 
         ActiveLlamaEditButton.Enabled := true
         ActiveLlamaStartButton.Enabled := true
@@ -4286,13 +4317,7 @@ UpdateLlamaState() {
             "Existing llama-server"
 
         ActiveLlamaDetails.Text :=
-            ActiveContext
-            . " context  •  "
-            . ActiveCache
-            . " KV  •  "
-            . Server.Name
-            . "  •  Port "
-            . Server.Port
+            GetActiveLlamaDetails()
             . "  •  Not owned by controller"
 
         ActiveLlamaEditButton.Enabled := false
@@ -4313,14 +4338,7 @@ UpdateLlamaState() {
     ActiveLlamaName.Text :=
         Model.Name
 
-    ActiveLlamaDetails.Text :=
-        ActiveContext
-        . " context  •  "
-        . ActiveCache
-        . " KV  •  "
-        . Server.Name
-        . "  •  Port "
-        . Server.Port
+    ActiveLlamaDetails.Text := GetActiveLlamaDetails()
 
 
     if Status = 503 {
@@ -4345,7 +4363,10 @@ UpdateLlamaState() {
 
         ActiveLlamaEditButton.Enabled := true
         ActiveLlamaStartButton.Enabled := false
-        ActiveLlamaRestartButton.Enabled := true
+        ActiveLlamaRestartButton.Enabled :=
+            GetServer(ActiveServerKey)
+                ? true
+                : false
         ActiveLlamaStopButton.Enabled := true
 
         return true
@@ -4359,12 +4380,16 @@ UpdateLlamaState() {
             . Status
 
         ActiveLlamaStartButton.Enabled := false
-        ActiveLlamaRestartButton.Enabled := true
+        ActiveLlamaRestartButton.Enabled :=
+            GetServer(ActiveServerKey)
+                ? true
+                : false
         ActiveLlamaStopButton.Enabled := true
 
         return false
     }
 }
+
 
 UpdateMcpState() {
     global McpPid
@@ -4632,6 +4657,7 @@ EnterActiveView(
 
     global ActiveModelKey
     global ActiveServerKey
+    global ActiveServerConfig
     global ActiveContext
     global ActiveCache
     global ActiveModelMcpDirectories
@@ -4667,6 +4693,7 @@ EnterActiveView(
 
     ActiveModelKey := ModelKey
     ActiveServerKey := ServerKey != "" ? ServerKey : Models[ModelKey].ServerKey
+    ActiveServerConfig := CreateServerRuntimeConfig(ActiveServerKey)
     ActiveContext := Context
     ActiveCache := Cache
     ActiveModelMcpDirectories := ModelMcpDirectories
@@ -4710,18 +4737,7 @@ EnterActiveView(
     ActiveLlamaStatus.Text := "◐ Starting"
     ActiveLlamaName.Text := Model.Name
 
-    Server := GetServer(ActiveServerKey)
-
-    ActiveLlamaDetails.Text :=
-        Server
-            ? Context
-                . " context  •  "
-                . Cache
-                . " KV  •  "
-                . Server.Name
-                . "  •  Port "
-                . Server.Port
-            : "Server not registered: " ActiveServerKey
+    ActiveLlamaDetails.Text := GetActiveLlamaDetails()
 
     if !DesiredMcp.Enabled {
         McpStartupUntil := 0
@@ -4780,6 +4796,7 @@ EnterActiveView(
 StartActiveLlama(*) {
     global ActiveModelKey
     global ActiveServerKey
+    global ActiveServerConfig
     global ActiveContext
     global ActiveCache
 
@@ -4801,13 +4818,32 @@ StartActiveLlama(*) {
     ; attempt to launch another process on the same endpoint.
     LlamaProbeSuppressed := false
 
-    HealthURL := GetModelHealthURL(
-        ActiveModelKey,
+    DesiredServer := CreateServerRuntimeConfig(
         ActiveServerKey
+    )
+
+    if !DesiredServer {
+        ActiveServerConfig := 0
+
+        MsgBox(
+            "The active model references an unregistered llama server:`n`n"
+            . ActiveServerKey,
+            "Local AI",
+            "Icon!"
+        )
+
+        LlamaProbeSuppressed := true
+        UpdateActiveState()
+        return
+    }
+
+    HealthURL := GetServerHealthURL(
+        DesiredServer
     )
 
     if HealthURL != ""
     && HttpStatus(HealthURL, 200) != 0 {
+        ActiveServerConfig := DesiredServer
         UpdateActiveState()
         return
     }
@@ -4819,16 +4855,21 @@ StartActiveLlama(*) {
     ActiveLlamaRestartButton.Enabled := false
     ActiveLlamaStopButton.Enabled := false
 
-    if !StartLlama(
+    if StartLlama(
         ActiveModelKey,
         ActiveContext,
         ActiveCache,
         ActiveServerKey
     ) {
+        ActiveServerConfig := DesiredServer
+        RefreshActiveLlamaDetails()
+    }
+    else {
         LlamaProbeSuppressed := true
         UpdateActiveState()
     }
 }
+
 
 RestartLlamaWithOfflineURL(
     OfflineURL := ""
@@ -4865,12 +4906,11 @@ RestartLlamaWithOfflineURL(
 }
 
 RestartActiveLlama(*) {
-    global ActiveModelKey, ActiveServerKey
+    global ActiveServerConfig
 
     RestartLlamaWithOfflineURL(
-        GetModelHealthURL(
-            ActiveModelKey,
-            ActiveServerKey
+        GetServerHealthURL(
+            ActiveServerConfig
         )
     )
 }
@@ -4878,7 +4918,7 @@ RestartActiveLlama(*) {
 
 StopActiveLlama(*) {
     global LlamaPid
-    global ActiveModelKey, ActiveServerKey
+    global ActiveServerConfig
 
     global ActiveLlamaStatus
     global FastPollRate
@@ -4889,9 +4929,7 @@ StopActiveLlama(*) {
         FastPollRate
     )
 
-    Server := GetServer(
-        ActiveServerKey
-    )
+    Server := ActiveServerConfig
 
 
     ; --------------------------------------------------------
@@ -4900,10 +4938,9 @@ StopActiveLlama(*) {
 
     if LlamaPid
     && ProcessExist(LlamaPid) {
-        HealthURL :=
+        HealthURL := GetServerHealthURL(
             Server
-                ? GetServerWebUI(Server) "/health"
-                : ""
+        )
 
         ActiveLlamaStatus.Text :=
             "◐ Stopping"
@@ -4931,9 +4968,9 @@ StopActiveLlama(*) {
     ;  EXTERNAL
     ; --------------------------------------------------------
 
-    if !Server {
+    if !IsObject(Server) {
         MsgBox(
-            "The active model does not reference a registered llama server.",
+            "No active llama-server endpoint is available.",
             "Local AI",
             "Icon!"
         )
@@ -4941,15 +4978,12 @@ StopActiveLlama(*) {
         return
     }
 
-    HealthURL :=
-        GetServerWebUI(
-            Server
-        )
-        . "/health"
+    HealthURL := GetServerHealthURL(
+        Server
+    )
 
-    if HttpStatus(
-        HealthURL
-    ) = 0
+    if HealthURL = ""
+    || HttpStatus(HealthURL) = 0
         return
 
 
@@ -6194,12 +6228,16 @@ CloseServerEditor(*) {
 NotifyServerManagerChanged(ServerKey := "") {
     global ServerManagerState
 
-    if !IsObject(ServerManagerState)
-        return
+    if IsObject(ServerManagerState) {
+        Callback := ServerManagerState.OnChanged
+        if IsObject(Callback)
+            Callback.Call(ServerKey)
+    }
 
-    Callback := ServerManagerState.OnChanged
-    if IsObject(Callback)
-        Callback.Call(ServerKey)
+    ; Registry edits should refresh persistent/configuration views immediately,
+    ; but must not rewrite the endpoint snapshot of a live llama session.
+    UpdateMainModelInfo()
+    RefreshActiveLlamaDetails()
 }
 
 ; ============================================================
@@ -6379,15 +6417,6 @@ GetModelsUsingServer(ServerKey) {
 }
 
 
-ServerExists(ServerKey) {
-    global Servers
-
-    return Servers.Has(
-        ServerKey
-    )
-}
-
-
 GetServer(ServerKey) {
     global Servers
 
@@ -6401,25 +6430,41 @@ GetServer(ServerKey) {
     ]
 }
 
-GetModelServer(ModelKey) {
-    global Models
-    global Servers
+CreateServerRuntimeConfig(ServerKey) {
+    Server := GetServer(
+        ServerKey
+    )
 
-    if !Models.Has(ModelKey)
+    if !Server
+        return 0
+
+    return {
+        Key: ServerKey,
+        Name: Server.Name,
+        Executable: Server.Executable,
+        Address: Server.Address,
+        Port: Server.Port,
+        Args: Server.Args
+    }
+}
+
+
+SameServerRuntimeConfig(A, B) {
+    if !IsObject(A)
+    || !IsObject(B)
         return false
 
-    ServerKey :=
-        Models[ModelKey].ServerKey
-
-    if ServerKey = ""
-    || !Servers.Has(ServerKey)
-        return false
-
-    return Servers[ServerKey]
+    return StrLower(Trim(A.Executable)) = StrLower(Trim(B.Executable))
+        && StrLower(Trim(A.Address)) = StrLower(Trim(B.Address))
+        && (A.Port + 0) = (B.Port + 0)
+        && Trim(A.Args) = Trim(B.Args)
 }
 
 
 GetServerWebUI(Server) {
+    if !IsObject(Server)
+        return ""
+
     Address := Trim(
         Server.Address
     )
@@ -6443,29 +6488,105 @@ GetServerWebUI(Server) {
 }
 
 
-GetModelWebUI(ModelKey, ServerKey := "") {
-    Server := ServerKey != ""
-        ? GetServer(ServerKey)
-        : GetModelServer(ModelKey)
+GetServerHealthURL(Server) {
+    WebUI := GetServerWebUI(
+        Server
+    )
 
-    if !Server
-        return ""
-
-    return GetServerWebUI(Server)
+    return WebUI != ""
+        ? WebUI . "/health"
+        : ""
 }
 
 
-GetModelHealthURL(ModelKey, ServerKey := "") {
-    WebUI :=
-        GetModelWebUI(
-            ModelKey,
-            ServerKey
-        )
+GetActiveServerDisplayName() {
+    global ActiveServerKey
+    global ActiveServerConfig
 
-    if WebUI = ""
+    if IsObject(ActiveServerConfig) {
+        if ActiveServerConfig.Key = ActiveServerKey {
+            Registered := GetServer(
+                ActiveServerKey
+            )
+
+            if Registered
+                return Registered.Name
+        }
+
+        return ActiveServerConfig.Name
+    }
+
+    Registered := GetServer(
+        ActiveServerKey
+    )
+
+    return Registered
+        ? Registered.Name
+        : ActiveServerKey
+}
+
+
+GetActiveServerPendingNote() {
+    global ActiveServerKey
+    global ActiveServerConfig
+
+    if !IsObject(ActiveServerConfig)
         return ""
 
-    return WebUI "/health"
+    if ActiveServerConfig.Key != ActiveServerKey
+        return "Server changes pending"
+
+    Registered := GetServer(
+        ActiveServerKey
+    )
+
+    if !Registered
+        return "Server registration removed"
+
+    return SameServerRuntimeConfig(
+        ActiveServerConfig,
+        Registered
+    )
+        ? ""
+        : "Server changes pending"
+}
+
+
+GetActiveLlamaDetails() {
+    global ActiveContext
+    global ActiveCache
+    global ActiveServerKey
+    global ActiveServerConfig
+
+    if !IsObject(ActiveServerConfig)
+        return "Server not registered: " ActiveServerKey
+
+    Details :=
+        ActiveContext
+        . " context  •  "
+        . ActiveCache
+        . " KV  •  "
+        . GetActiveServerDisplayName()
+        . "  •  Port "
+        . ActiveServerConfig.Port
+
+    Note := GetActiveServerPendingNote()
+
+    if Note != ""
+        Details .= "  •  " Note
+
+    return Details
+}
+
+
+RefreshActiveLlamaDetails() {
+    global ControllerMode
+    global ActiveLlamaDetails
+
+    if ControllerMode != "active"
+        return
+
+    ActiveLlamaDetails.Text := GetActiveLlamaDetails()
 }
 
 ; ============================================================
@@ -6572,17 +6693,15 @@ ShowController(*) {
 }
 
 OpenChat(*) {
-    global ActiveModelKey, ActiveServerKey
+    global ActiveServerConfig
 
-    WebUI :=
-        GetModelWebUI(
-            ActiveModelKey,
-            ActiveServerKey
-        )
+    WebUI := GetServerWebUI(
+        ActiveServerConfig
+    )
 
     if WebUI = "" {
         MsgBox(
-            "The active model does not reference a registered llama server.",
+            "No active llama-server endpoint is available.",
             "Local AI",
             "Icon!"
         )
@@ -6594,6 +6713,7 @@ OpenChat(*) {
         WebUI
     )
 }
+
 
 GetListeningPid(Port) {
     Shell := ComObject(
