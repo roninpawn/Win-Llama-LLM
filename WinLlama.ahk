@@ -1,7 +1,13 @@
 #Requires AutoHotkey v2.0
-#SingleInstance Force
+#SingleInstance Off
 
 Persistent true
+
+InstanceMutex := AcquireInstanceMutex()
+
+if !InstanceMutex
+    ExitApp
+
 OnExit(CleanupOwnedServices)
 
 ; ============================================================
@@ -158,6 +164,7 @@ ActiveModelKey := ""
 ActiveServerKey := ""
 ActiveContext := 0
 ActiveCache := ""
+ActiveModelMcpDirectories := ""
 ActiveMcpDirectories := ""
 ActiveMcpConfig := 0
 
@@ -174,6 +181,11 @@ IdlePollRate := 5000
 LlamaState := "offline"
 McpState := "offline"
 
+; Once llama is known Offline, stop automatic HTTP probes until
+; the user explicitly starts/restarts it or a new session begins.
+LlamaProbeSuppressed := false
+McpProbeSuppressed := false
+
 LlamaStartupUntil := 0
 McpStartupUntil := 0
 LlamaStartupGrace := 30000
@@ -184,6 +196,9 @@ McpStartupGrace := 15000
 ; ============================================================
 
 ConsoleGui := 0
+ConsoleOutput := 0
+ConsoleOutputNoWrap := 0
+ConsoleOutputWrap := 0
 
 ConsoleActiveTab := "llama"
 
@@ -870,7 +885,6 @@ MainGui.SetFont("s16 Bold c" TextColor, "Segoe UI")
 MainGui.AddText("xm w520 Center", "LOCAL AI")
 
 MainGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
-
 MainGui.AddText("xm y+24", "Model")
 
 ModelNames := []
@@ -883,9 +897,7 @@ InitialModelKey :=
         : ModelList[1]
 
 for Index, Key in ModelList {
-    ModelNames.Push(
-        Models[Key].Name
-    )
+    ModelNames.Push(Models[Key].Name)
 
     if Key = InitialModelKey
         InitialIndex := Index
@@ -903,13 +915,18 @@ BuildActiveGui()
 
 
 ; ------------------------------------------------------------
-;  DEFAULT INFORMATION
+;  MODEL INFORMATION
 ; ------------------------------------------------------------
 
 MainGui.SetFont("s11 c" MutedColor, "Segoe UI")
 
+MainServerText := MainGui.AddText(
+    "xm y+16 w520",
+    ""
+)
+
 MainContextText := MainGui.AddText(
-    "xm y+16 w260",
+    "xm y+4 w260",
     ""
 )
 
@@ -924,14 +941,21 @@ MainCacheText := MainGui.AddText(
 ; ------------------------------------------------------------
 
 MainGui.SetFont("s12 c" TextColor, "Segoe UI")
-MainGui.AddText("xm y+22", "MCP Access")
+MainGui.AddText("xm y+22 w478", "MCP Access")
+
+MainGui.SetFont("s11 c" TextColor, "Segoe UI")
+MainMcpEditButton := MainGui.AddButton(
+    "x+16 yp-3 w26 h26",
+    "…"
+)
+MakeOwnerDrawButton(MainMcpEditButton)
 
 MainGui.SetFont("s11 c" MutedColor, "Segoe UI")
-
 MainMcpText := MainGui.AddText(
-    "xm y+7 w520",
-    DisplayDirectories(McpDirectories)
+    "xm y+7 w520 h74",
+    ""
 )
+
 
 ; ------------------------------------------------------------
 ;  BUTTONS
@@ -940,20 +964,21 @@ MainMcpText := MainGui.AddText(
 MainGui.SetFont("s12 c" TextColor, "Segoe UI")
 
 StartButton := MainGui.AddButton(
-    "xm y+26 w250 h46",
+    "xm y+20 w250 h46",
     "Start"
 )
 
 ConfigButton := MainGui.AddButton(
     "x+20 yp w250 h46",
-    "Configure..."
+    "Configure Session"
 )
 
 MakeOwnerDrawButton(StartButton)
 MakeOwnerDrawButton(ConfigButton)
 
 StartButton.OnEvent("Click", StartSelected)
-ConfigButton.OnEvent("Click", OpenConfig)
+ConfigButton.OnEvent("Click", OpenSessionConfig)
+MainMcpEditButton.OnEvent("Click", OpenMainMcpEditor)
 MainModelControl.OnEvent("Change", UpdateMainModelInfo)
 
 MainGui.OnEvent("Close", HideController)
@@ -968,14 +993,47 @@ MainGui.Show("w572")
 ; ============================================================
 
 UpdateMainModelInfo(*) {
-    global MainModelControl, MainContextText, MainCacheText
-    global ModelList, Models
+    global MainModelControl
+    global MainContextText, MainCacheText, MainServerText
+    global MainMcpText
+    global ModelList, Models, Servers
+    global McpEnabled, McpAddress, McpPort
 
-    Key := ModelList[MainModelControl.Value]
+    Index := MainModelControl.Value
+    if Index < 1 || Index > ModelList.Length
+        return
+
+    Key := ModelList[Index]
     Model := Models[Key]
 
     MainContextText.Text := "Context:  " Model.Context
     MainCacheText.Text := "KV cache:  " Model.Cache
+
+    if Servers.Has(Model.ServerKey) {
+        Server := Servers[Model.ServerKey]
+        MainServerText.Text :=
+            "Server:  " Server.Name
+            . "  •  " Server.Address ":" Server.Port
+    }
+    else {
+        MainServerText.Text :=
+            "Server:  Missing: " Model.ServerKey
+    }
+
+    if !McpEnabled {
+        MainMcpText.Text := "Disabled"
+        return
+    }
+
+    Directories := GetEffectiveMcpDirectories(Key)
+    MainMcpText.Text := "mcp-proxy:  " McpAddress ":" McpPort
+
+    if Trim(Directories) = "" {
+        MainMcpText.Text .= "`nNo filesystem roots configured."
+        return
+    }
+
+    MainMcpText.Text .= "`n" DisplayDirectories(Directories)
 }
 
 
@@ -986,7 +1044,6 @@ UpdateMainModelInfo(*) {
 StartSelected(*) {
     global MainModelControl
     global ModelList, Models
-    global McpDirectories
 
     Key := ModelList[
         MainModelControl.Value
@@ -998,14 +1055,24 @@ StartSelected(*) {
         Key,
         Model.Context,
         Model.Cache,
-        McpDirectories
+        Model.ServerKey,
+        Model.McpDirectories
     )
 
     LaunchAI(
         Key,
         "",
-        "",
-        McpDirectories
+        ""
+    )
+}
+
+
+OpenMainMcpEditor(*) {
+    global MainGui
+
+    OpenMcpConfigEditor(
+        MainGui,
+        false
     )
 }
 
@@ -1044,7 +1111,7 @@ class ModelConfigPanel {
         ApplyDarkControl(this.ServerControl)
 
         GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
-        this.ServerManagerButton := GuiObj.AddButton("x+8 yp w26 h26", "+")
+        this.ServerManagerButton := GuiObj.AddButton("x+8 yp w26 h26", "…")
         MakeOwnerDrawButton(this.ServerManagerButton)
 
         Y += 50
@@ -1478,173 +1545,26 @@ class McpConfigPanel {
 }
 
 ; ============================================================
-;  MASTER CONFIGURATION
+;  STARTUP SESSION CONFIGURATION
 ; ============================================================
 
-OpenConfig(*) {
+OpenSessionConfig(*) {
     global MainGui
-    global MainModelControl
-    global ModelList
-    global McpEnabled, McpAddress, McpPort
-    global McpDirectories
-    global BaseColor, TextColor
 
-    ConfigGui := Gui(
-        ,
-        "Configure Local AI"
-    )
-	
-	if !BeginConfigDialog(
-		ConfigGui,
-		MainGui
-	)
-		return
-
-    ConfigGui.BackColor := BaseColor
-    ConfigGui.MarginX := 26
-    ConfigGui.MarginY := 22
-
-    ApplyDarkWindow(ConfigGui)
-
-
-    ; --------------------------------------------------------
-    ;  TITLE
-    ; --------------------------------------------------------
-
-    ConfigGui.SetFont(
-        "s16 Bold c" TextColor,
-        "Segoe UI"
-    )
-
-    ConfigGui.AddText(
-        "xm w520 Center",
-        "CONFIGURE LOCAL AI"
-    )
-
-
-    ; --------------------------------------------------------
-    ;  PANELS
-    ; --------------------------------------------------------
-
-    ModelKey := ModelList[
-        MainModelControl.Value
-    ]
-
-    ModelPanel := ModelConfigPanel(
-        ConfigGui,
-        26,
-        76,
-        520,
-        ModelKey
-    )
-
-    McpPanel := McpConfigPanel(
-        ConfigGui,
-        26,
-        ModelPanel.Bottom + 20,
-        520,
-        McpEnabled,
-        McpAddress,
-        McpPort,
-        McpDirectories
-    )
-
-
-    ; --------------------------------------------------------
-    ;  BUTTONS
-    ; --------------------------------------------------------
-
-    ConfigGui.SetFont(
-        "s12 c" TextColor,
-        "Segoe UI"
-    )
-
-    StartButton := ConfigGui.AddButton(
-        "x26 y" McpPanel.Bottom + 24
-        . " w250 h44",
-        "Start"
-    )
-
-    CancelButton := ConfigGui.AddButton(
-        "x296 yp w250 h44",
-        "Cancel"
-    )
-
-    MakeOwnerDrawButton(StartButton)
-    MakeOwnerDrawButton(CancelButton)
-
-
-    StartButton.OnEvent(
-        "Click",
-        (*) => StartMasterConfig(
-            ConfigGui,
-            ModelPanel,
-            McpPanel
-        )
-    )
-
-	CancelButton.OnEvent(
-		"Click",
-		(*) => EndConfigDialog(
-			ConfigGui,
-			MainGui
-		)
-	)
-
-	ConfigGui.OnEvent(
-		"Close",
-		(*) => EndConfigDialog(
-			ConfigGui,
-			MainGui
-		)
-	)
-
-	ShowRelative(
-		ConfigGui,
-		MainGui
-	)
-}
-
-
-StartMasterConfig(
-    ConfigGui,
-    ModelPanel,
-    McpPanel
-) {
-    Values := ModelPanel.GetValues()
-
-    if !Values
+    ModelKey := GetMainSelectedModelKey()
+    if ModelKey = ""
         return
 
-    McpValues := McpPanel.GetValues()
-
-    if !McpValues
-        return
-
-    Directories := McpValues.Directories
-
-    EndConfigDialog(
-        ConfigGui,
+    OpenModelConfigEditor(
         MainGui,
-        false
-    )
-
-    EnterActiveView(
-        Values.ModelKey,
-        Values.Context,
-        Values.Cache,
-        Directories,
-        Values.ServerKey
-    )
-
-    LaunchAI(
-        Values.ModelKey,
-        Values.Context,
-        Values.Cache,
-        Directories,
-        Values.ServerKey
+        ModelKey,
+        "",
+        "",
+        "",
+        "start"
     )
 }
+
 
 ; ============================================================
 ;  ACTIVE WINDOW
@@ -1926,30 +1846,53 @@ BuildActiveGui() {
 ; ============================================================
 
 OpenModelEditor(*) {
+    global ActiveGui
     global ActiveModelKey
     global ActiveServerKey
     global ActiveContext
     global ActiveCache
 
+    OpenModelConfigEditor(
+        ActiveGui,
+        ActiveModelKey,
+        ActiveContext,
+        ActiveCache,
+        ActiveServerKey,
+        "apply"
+    )
+}
+
+
+OpenModelConfigEditor(
+    ParentGui,
+    ModelKey,
+    Context := "",
+    Cache := "",
+    ServerKey := "",
+    ActionMode := "apply"
+) {
     global BaseColor, TextColor
+
+    IsStartMode := ActionMode = "start"
 
     EditorGui := Gui(
         ,
-        "Model Settings"
+        IsStartMode
+            ? "Configure Session"
+            : "Model Settings"
     )
 
-	if !BeginConfigDialog(
-		EditorGui,
-		ActiveGui
-	)
-		return
+    if !BeginConfigDialog(
+        EditorGui,
+        ParentGui
+    )
+        return
 
     EditorGui.BackColor := BaseColor
     EditorGui.MarginX := 24
     EditorGui.MarginY := 20
 
     ApplyDarkWindow(EditorGui)
-
 
     EditorGui.SetFont(
         "s14 Bold c" TextColor,
@@ -1958,179 +1901,224 @@ OpenModelEditor(*) {
 
     EditorGui.AddText(
         "xm w480 Center",
-        "MODEL SETTINGS"
+        IsStartMode
+            ? "CONFIGURE SESSION"
+            : "MODEL SETTINGS"
     )
-
 
     ModelPanel := ModelConfigPanel(
         EditorGui,
         24,
         70,
         480,
-        ActiveModelKey,
-        ActiveContext,
-        ActiveCache,
-        ActiveServerKey
+        ModelKey,
+        Context,
+        Cache,
+        ServerKey
     )
-
 
     EditorGui.SetFont(
         "s12 c" TextColor,
         "Segoe UI"
     )
 
-	ApplyButton := EditorGui.AddButton(
-		"x24 y" ModelPanel.Bottom + 22
-		. " w150 h42",
-		"Apply"
-	)
+    PrimaryButton := EditorGui.AddButton(
+        "x24 y" ModelPanel.Bottom + 22
+        . " w150 h42",
+        IsStartMode ? "Start" : "Apply"
+    )
 
-	SaveDefaultsButton := EditorGui.AddButton(
-		"x189 yp w150 h42",
-		"Save Defaults"
-	)
+    SaveDefaultsButton := EditorGui.AddButton(
+        "x189 yp w150 h42",
+        "Save Defaults"
+    )
 
-	CancelButton := EditorGui.AddButton(
-		"x354 yp w150 h42",
-		"Cancel"
-	)
+    CancelButton := EditorGui.AddButton(
+        "x354 yp w150 h42",
+        "Cancel"
+    )
 
-	MakeOwnerDrawButton(ApplyButton)
-	MakeOwnerDrawButton(SaveDefaultsButton)
-	MakeOwnerDrawButton(CancelButton)
+    MakeOwnerDrawButton(PrimaryButton)
+    MakeOwnerDrawButton(SaveDefaultsButton)
+    MakeOwnerDrawButton(CancelButton)
 
-	EditorGui.OnEvent(
-		"Close",
-		(*) => EndConfigDialog(
-			EditorGui,
-			ActiveGui
-		)
-	)
+    if IsStartMode {
+        PrimaryButton.OnEvent(
+            "Click",
+            (*) => StartModelSession(
+                EditorGui,
+                ParentGui,
+                ModelPanel
+            )
+        )
+    }
+    else {
+        PrimaryButton.OnEvent(
+            "Click",
+            (*) => ApplyModelConfig(
+                EditorGui,
+                ModelPanel
+            )
+        )
+    }
 
-    ApplyButton.OnEvent(
+    SaveDefaultsButton.OnEvent(
         "Click",
-        (*) => ApplyModelConfig(
-            EditorGui,
+        (*) => SaveModelEditorDefaults(
             ModelPanel
         )
     )
-	
-	SaveDefaultsButton.OnEvent(
-		"Click",
-		(*) => SaveModelEditorDefaults(
-			ModelPanel
-		)
-	)
 
-	CancelButton.OnEvent(
-		"Click",
-		(*) => EndConfigDialog(
-			EditorGui,
-			ActiveGui
-		)
-	)
+    CancelButton.OnEvent(
+        "Click",
+        (*) => EndConfigDialog(
+            EditorGui,
+            ParentGui
+        )
+    )
+
+    EditorGui.OnEvent(
+        "Close",
+        (*) => EndConfigDialog(
+            EditorGui,
+            ParentGui
+        )
+    )
 
     ShowRelative(
-		EditorGui,
-		ActiveGui
-	)
+        EditorGui,
+        ParentGui
+    )
 }
 
+
+StartModelSession(EditorGui, ParentGui, ModelPanel) {
+    Values := ModelPanel.GetValues()
+
+    if !Values
+        return
+
+    EndConfigDialog(
+        EditorGui,
+        ParentGui,
+        false
+    )
+
+    EnterActiveView(
+        Values.ModelKey,
+        Values.Context,
+        Values.Cache,
+        Values.ServerKey,
+        Values.McpDirectories
+    )
+
+    LaunchAI(
+        Values.ModelKey,
+        Values.Context,
+        Values.Cache,
+        Values.ServerKey
+    )
+}
+
+
 ApplyModelConfig(EditorGui, ModelPanel) {
+    global ActiveGui
     global ActiveModelKey
     global ActiveServerKey
     global ActiveContext
     global ActiveCache
-
-	global LlamaPid
+    global ActiveModelMcpDirectories
+    global LlamaPid
+    global LlamaState
 
     Values := ModelPanel.GetValues()
 
     if !Values
         return
 
+    LlamaChanged :=
+        Values.ModelKey != ActiveModelKey
+        || Values.ServerKey != ActiveServerKey
+        || Values.Context != ActiveContext
+        || Values.Cache != ActiveCache
 
-    ; --------------------------------------------------------
-    ;  NOTHING CHANGED
-    ; --------------------------------------------------------
+    McpRootsChanged := !SameDirectories(
+        Values.McpDirectories,
+        ActiveModelMcpDirectories
+    )
 
-    if Values.ModelKey = ActiveModelKey
-    && Values.ServerKey = ActiveServerKey
-    && Values.Context = ActiveContext
-    && Values.Cache = ActiveCache {
+    StartNeeded :=
+        LlamaState = "offline"
+        && (!LlamaPid || !ProcessExist(LlamaPid))
+
+    if !LlamaChanged
+    && !McpRootsChanged
+    && !StartNeeded {
         EndConfigDialog(
-			EditorGui,
-			ActiveGui
-		)
+            EditorGui,
+            ActiveGui
+        )
         return
     }
 
+    OldHealthURL := ""
+    Status := 0
 
-	OldHealthURL :=
-		GetModelHealthURL(
-			ActiveModelKey,
+    ; When the active model is already known Offline, don't probe the old
+    ; endpoint just to prove it again. Apply will start the selected model.
+    if LlamaChanged && !StartNeeded {
+        OldHealthURL := GetModelHealthURL(
+            ActiveModelKey,
             ActiveServerKey
-		)
-
-	Status :=
-		OldHealthURL != ""
-			? HttpStatus(
-				OldHealthURL
-			)
-			: 0
-
-    Owned :=
-        LlamaPid
-        && ProcessExist(LlamaPid)
-
-
-    ; --------------------------------------------------------
-    ;  EXTERNAL SERVER
-    ; --------------------------------------------------------
-
-    if Status != 0 && !Owned {
-        MsgBox(
-            "The active llama-server was not started by this controller.`n`n"
-            . "Its configuration cannot be changed safely.",
-            "Model Settings",
-            "Icon!"
         )
 
-        return
+        Status :=
+            OldHealthURL != ""
+                ? HttpStatus(OldHealthURL)
+                : 0
+
+        Owned :=
+            LlamaPid
+            && ProcessExist(LlamaPid)
+
+        if Status != 0 && !Owned {
+            MsgBox(
+                "The active llama-server was not started by this controller.`n`n"
+                . "Its configuration cannot be changed safely.",
+                "Model Settings",
+                "Icon!"
+            )
+
+            return
+        }
     }
-
-
-    ; --------------------------------------------------------
-    ;  STORE NEW ACTIVE CONFIG
-    ; --------------------------------------------------------
 
     ActiveModelKey := Values.ModelKey
     ActiveServerKey := Values.ServerKey
     ActiveContext := Values.Context
     ActiveCache := Values.Cache
+    ActiveModelMcpDirectories := Values.McpDirectories
 
     SyncMainModelSelection(
         ActiveModelKey
     )
 
     EndConfigDialog(
-		EditorGui,
-		ActiveGui
-	)
+        EditorGui,
+        ActiveGui
+    )
 
-
-    ; --------------------------------------------------------
-    ;  APPLY
-    ; --------------------------------------------------------
-
-	if Status != 0 {
-		RestartLlamaWithOfflineURL(
-			OldHealthURL
-		)
-	}
-	else {
-		UpdateActiveState()
-	}
+    if LlamaChanged && Status != 0 {
+        RestartLlamaWithOfflineURL(
+            OldHealthURL
+        )
+    }
+    else if StartNeeded {
+        StartActiveLlama()
+    }
+    else {
+        UpdateActiveState()
+    }
 }
 
 SaveModelEditorDefaults(ModelPanel) {
@@ -2204,7 +2192,7 @@ OpenAddModelDialog(ParentGui, OnSaved := 0) {
     ApplyDarkControl(ServerControl)
 
     DialogGui.SetFont("s11 c" TextColor, "Segoe UI")
-    ServerManagerButton := DialogGui.AddButton("x478 yp w26 h26", "+")
+    ServerManagerButton := DialogGui.AddButton("x478 yp w26 h26", "…")
     MakeOwnerDrawButton(ServerManagerButton)
 
     DialogGui.SetFont("s10 c" MutedColor, "Segoe UI")
@@ -2545,9 +2533,6 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false) {
 
 
 SaveMcpEditorConfig(McpPanel) {
-    global MainMcpText
-    global McpDirectories
-
     Values := McpPanel.GetValues()
 
     if !Values
@@ -2564,10 +2549,7 @@ SaveMcpEditorConfig(McpPanel) {
         Values.Directories
     )
 
-    MainMcpText.Text :=
-        DisplayDirectories(
-            McpDirectories
-        )
+    UpdateMainModelInfo()
 
     return Values
 }
@@ -2724,6 +2706,8 @@ OpenConsoleViewer(*) {
     global ConsoleEffectiveText
     global ConsoleRefreshControl
     global ConsoleOutput
+    global ConsoleOutputNoWrap
+    global ConsoleOutputWrap
 
     global ActiveGui
 
@@ -2872,13 +2856,30 @@ OpenConsoleViewer(*) {
 		"Consolas"
 	)
 
-	ConsoleOutput := ConsoleGui.AddEdit(
+	ConsoleOutputNoWrap := ConsoleGui.AddEdit(
 		"x22 y54 w900 r30 ReadOnly -VScroll -Wrap Background"
 		. SecondaryColor
 		. " c"
 		. TextColor,
 		""
 	)
+
+	ConsoleOutputWrap := ConsoleGui.AddEdit(
+		"x22 y54 w900 r30 ReadOnly -VScroll +Wrap Background"
+		. SecondaryColor
+		. " c"
+		. TextColor,
+		""
+	)
+
+	if ConsoleWrapEnabled {
+		ConsoleOutput := ConsoleOutputWrap
+		ConsoleOutputNoWrap.Visible := false
+	}
+	else {
+		ConsoleOutput := ConsoleOutputNoWrap
+		ConsoleOutputWrap.Visible := false
+	}
 
 
     ; --------------------------------------------------------
@@ -3042,47 +3043,34 @@ ToggleConsoleWrap(*) {
 }
 
 RebuildConsoleOutput() {
-    global ConsoleGui
     global ConsoleOutput
+    global ConsoleOutputNoWrap
+    global ConsoleOutputWrap
     global ConsoleWrapEnabled
     global ConsoleActiveTab
 
     global ConsoleLlamaText
     global ConsoleMcpText
 
-    global SecondaryColor
-    global TextColor
 
+    Text :=
+        ConsoleActiveTab = "llama"
+        ? ConsoleLlamaText
+        : ConsoleMcpText
 
-    if ConsoleActiveTab = "llama"
-        Text := ConsoleLlamaText
-    else
-        Text := ConsoleMcpText
+    OldOutput := ConsoleOutput
 
-
-    ; Remove the old display control.
-    ConsoleOutput.Visible := false
-
-
-    ConsoleGui.SetFont(
-        "s10 c" TextColor,
-        "Consolas"
-    )
-
-    WrapOption :=
+    ConsoleOutput :=
         ConsoleWrapEnabled
-        ? "+Wrap"
-        : "-Wrap"
+        ? ConsoleOutputWrap
+        : ConsoleOutputNoWrap
 
-    ConsoleOutput := ConsoleGui.AddEdit(
-        "x22 y50 w900 r30 ReadOnly -VScroll "
-        . WrapOption
-        . " Background"
-        . SecondaryColor
-        . " c"
-        . TextColor,
-        Text
-    )
+    ConsoleOutput.Value := Text
+
+    if IsObject(OldOutput)
+        OldOutput.Visible := false
+
+    ConsoleOutput.Visible := true
 
     ScrollConsoleToBottom()
 }
@@ -3584,9 +3572,10 @@ StopProcessTree(Pid) {
 ;  LAUNCH
 ; ============================================================
 
-LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverride := "") {
+LaunchAI(ModelKey, ContextOverride, CacheOverride, ServerKeyOverride := "") {
 	global Models
     global McpStartupUntil
+    global McpProbeSuppressed
     global ActiveMcpConfig, ActiveMcpDirectories
     global ActiveHasLaunched
 
@@ -3603,6 +3592,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
 			"Iconx"
 		)
 
+        ReturnToStartup()
 		return
 	}
 
@@ -3631,6 +3621,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
 			"Iconx"
 		)
 
+        ReturnToStartup()
 		return
 	}
 
@@ -3660,6 +3651,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
     ActiveMcpConfig := 0
     ActiveMcpDirectories := ""
     McpStartupUntil := 0
+    McpProbeSuppressed := !DesiredMcp.Enabled
 
     if DesiredMcp.Enabled {
         McpURL := GetMcpStatusURL(
@@ -3680,6 +3672,8 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
                 )
 
             if DesiredMcp.Directories = "" {
+                McpProbeSuppressed := true
+
                 if Trim(
                     GetEffectiveMcpDirectories(
                         ModelKey
@@ -3713,6 +3707,7 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
                     McpStartupUntil := 0
                     ActiveMcpConfig := 0
                     ActiveMcpDirectories := ""
+                    McpProbeSuppressed := true
 
                     MsgBox(
                         "MCP could not be started:`n`n"
@@ -4115,11 +4110,16 @@ UpdateLlamaState() {
 
     global LlamaStartupUntil
     global LlamaState
+    global LlamaProbeSuppressed
 
 
+    ; If a process we owned has disappeared, we already know the service is
+    ; offline. Don't keep proving that with blocking HTTP requests forever.
     if LlamaPid
-    && !ProcessExist(LlamaPid)
+    && !ProcessExist(LlamaPid) {
         LlamaPid := 0
+        LlamaProbeSuppressed := true
+    }
 
 
     if !Models.Has(
@@ -4143,6 +4143,7 @@ UpdateLlamaState() {
     if !Server {
         LlamaStartupUntil := 0
         LlamaState := "offline"
+        LlamaProbeSuppressed := true
 
         ActiveLlamaStatus.Text :=
             "○ Offline"
@@ -4167,6 +4168,40 @@ UpdateLlamaState() {
     }
 
 
+    Owned :=
+        LlamaPid
+        && ProcessExist(LlamaPid)
+
+
+    ; --------------------------------------------------------
+    ;  KNOWN OFFLINE — NO AUTOMATIC HTTP PROBE
+    ; --------------------------------------------------------
+
+    if LlamaProbeSuppressed && !Owned {
+        LlamaStartupUntil := 0
+        LlamaState := "offline"
+
+        ActiveLlamaStatus.Text := "○ Offline"
+        ActiveLlamaName.Text := Model.Name
+
+        ActiveLlamaDetails.Text :=
+            ActiveContext
+            . " context  •  "
+            . ActiveCache
+            . " KV  •  "
+            . Server.Name
+            . "  •  Port "
+            . Server.Port
+
+        ActiveLlamaEditButton.Enabled := true
+        ActiveLlamaStartButton.Enabled := true
+        ActiveLlamaRestartButton.Enabled := false
+        ActiveLlamaStopButton.Enabled := false
+
+        return true
+    }
+
+
     WebUI :=
         GetServerWebUI(
             Server
@@ -4174,10 +4209,6 @@ UpdateLlamaState() {
 
     HealthURL :=
         WebUI "/health"
-
-    Owned :=
-        LlamaPid
-        && ProcessExist(LlamaPid)
 
     Status :=
         HttpStatus(
@@ -4210,6 +4241,7 @@ UpdateLlamaState() {
 
         LlamaStartupUntil := 0
         LlamaState := "offline"
+        LlamaProbeSuppressed := true
 
         ActiveLlamaStatus.Text :=
             "○ Offline"
@@ -4223,7 +4255,7 @@ UpdateLlamaState() {
             . ActiveCache
             . " KV  •  "
             . Server.Name
-            . " : "
+            . "  •  Port "
             . Server.Port
 
         ActiveLlamaEditButton.Enabled := true
@@ -4241,6 +4273,7 @@ UpdateLlamaState() {
 
     if !Owned {
         LlamaState := "external"
+        LlamaProbeSuppressed := false
 
         if Status = 503
             ActiveLlamaStatus.Text :=
@@ -4253,7 +4286,11 @@ UpdateLlamaState() {
             "Existing llama-server"
 
         ActiveLlamaDetails.Text :=
-            Server.Name
+            ActiveContext
+            . " context  •  "
+            . ActiveCache
+            . " KV  •  "
+            . Server.Name
             . "  •  Port "
             . Server.Port
             . "  •  Not owned by controller"
@@ -4271,6 +4308,8 @@ UpdateLlamaState() {
     ;  OWNED
     ; --------------------------------------------------------
 
+    LlamaProbeSuppressed := false
+
     ActiveLlamaName.Text :=
         Model.Name
 
@@ -4280,7 +4319,7 @@ UpdateLlamaState() {
         . ActiveCache
         . " KV  •  "
         . Server.Name
-        . " : "
+        . "  •  Port "
         . Server.Port
 
 
@@ -4327,7 +4366,6 @@ UpdateLlamaState() {
     }
 }
 
-
 UpdateMcpState() {
     global McpPid
     global ActiveModelKey
@@ -4345,11 +4383,13 @@ UpdateMcpState() {
 
     global McpStartupUntil
     global McpState
+    global McpProbeSuppressed
 
 
     if McpPid
     && !ProcessExist(McpPid) {
         McpPid := 0
+        McpProbeSuppressed := true
 
         if IsObject(ActiveMcpConfig)
         && !ActiveMcpConfig.External {
@@ -4374,6 +4414,7 @@ UpdateMcpState() {
     if !IsObject(ActiveMcpConfig)
     && !Desired.Enabled {
         McpStartupUntil := 0
+        McpProbeSuppressed := true
         McpState := "disabled"
         ActiveMcpStatus.Text := "○ Disabled"
         ActiveMcpName.Text := "Disabled"
@@ -4381,6 +4422,29 @@ UpdateMcpState() {
 
         ActiveMcpEditButton.Enabled := true
         ActiveMcpStartButton.Enabled := false
+        ActiveMcpRestartButton.Enabled := false
+        ActiveMcpStopButton.Enabled := false
+
+        return true
+    }
+
+
+    ; --------------------------------------------------------
+    ;  KNOWN OFFLINE — NO AUTOMATIC HTTP PROBE
+    ; --------------------------------------------------------
+
+    if McpProbeSuppressed
+    && !Owned {
+        McpStartupUntil := 0
+        McpState := "offline"
+        ActiveMcpStatus.Text := "○ Offline"
+        ActiveMcpName.Text := "Filesystem"
+        ActiveMcpDetails.Text := DisplayDirectories(
+            Desired.Directories
+        )
+
+        ActiveMcpEditButton.Enabled := true
+        ActiveMcpStartButton.Enabled := Desired.Enabled
         ActiveMcpRestartButton.Enabled := false
         ActiveMcpStopButton.Enabled := false
 
@@ -4397,8 +4461,10 @@ UpdateMcpState() {
         )
     )
 
-    if Status != 0
+    if Status != 0 {
         McpStartupUntil := 0
+        McpProbeSuppressed := false
+    }
 
 
     ; --------------------------------------------------------
@@ -4427,8 +4493,12 @@ UpdateMcpState() {
         && !Owned {
             ActiveMcpConfig := 0
             ActiveMcpDirectories := ""
+            McpProbeSuppressed := true
             return UpdateMcpState()
         }
+
+        if !Owned
+            McpProbeSuppressed := true
 
         McpState := Owned
             ? "error"
@@ -4550,7 +4620,13 @@ UpdateMcpState() {
     return true
 }
 
-EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
+EnterActiveView(
+    ModelKey,
+    Context,
+    Cache,
+    ServerKey := "",
+    ModelMcpDirectories := ""
+) {
     global ControllerMode
     global ActiveHasLaunched
 
@@ -4558,6 +4634,7 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     global ActiveServerKey
     global ActiveContext
     global ActiveCache
+    global ActiveModelMcpDirectories
     global ActiveMcpDirectories
     global ActiveMcpConfig
 
@@ -4583,6 +4660,8 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     global ActiveMcpStopButton
 
     global LlamaState, McpState
+    global LlamaProbeSuppressed
+    global McpProbeSuppressed
     global LlamaStartupUntil, LlamaStartupGrace
     global McpStartupUntil, McpStartupGrace
 
@@ -4590,6 +4669,7 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     ActiveServerKey := ServerKey != "" ? ServerKey : Models[ModelKey].ServerKey
     ActiveContext := Context
     ActiveCache := Cache
+    ActiveModelMcpDirectories := ModelMcpDirectories
 
     ActiveMcpConfig := 0
     ActiveMcpDirectories := ""
@@ -4603,6 +4683,8 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
         A_TickCount
         + LlamaStartupGrace
 
+    LlamaProbeSuppressed := false
+    McpProbeSuppressed := false
     LlamaState := "loading"
     ActiveLlamaStatus.Text := "◐ Loading"
 
@@ -4628,11 +4710,18 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     ActiveLlamaStatus.Text := "◐ Starting"
     ActiveLlamaName.Text := Model.Name
 
+    Server := GetServer(ActiveServerKey)
+
     ActiveLlamaDetails.Text :=
-        Context
-        . " context  •  "
-        . Cache
-        . " KV"
+        Server
+            ? Context
+                . " context  •  "
+                . Cache
+                . " KV  •  "
+                . Server.Name
+                . "  •  Port "
+                . Server.Port
+            : "Server not registered: " ActiveServerKey
 
     if !DesiredMcp.Enabled {
         McpStartupUntil := 0
@@ -4700,11 +4789,28 @@ StartActiveLlama(*) {
     global ActiveLlamaStopButton
 
     global FastPollRate
+    global LlamaProbeSuppressed
 
 
     SetActivePollRate(
         FastPollRate
     )
+
+    ; Automatic probing is suspended while Offline. A deliberate Start gets
+    ; one probe so an independently-started server is detected before we
+    ; attempt to launch another process on the same endpoint.
+    LlamaProbeSuppressed := false
+
+    HealthURL := GetModelHealthURL(
+        ActiveModelKey,
+        ActiveServerKey
+    )
+
+    if HealthURL != ""
+    && HttpStatus(HealthURL, 200) != 0 {
+        UpdateActiveState()
+        return
+    }
 
     ActiveLlamaStatus.Text :=
         "◐ Starting"
@@ -4713,12 +4819,15 @@ StartActiveLlama(*) {
     ActiveLlamaRestartButton.Enabled := false
     ActiveLlamaStopButton.Enabled := false
 
-    StartLlama(
+    if !StartLlama(
         ActiveModelKey,
         ActiveContext,
         ActiveCache,
         ActiveServerKey
-    )
+    ) {
+        LlamaProbeSuppressed := true
+        UpdateActiveState()
+    }
 }
 
 RestartLlamaWithOfflineURL(
@@ -4773,6 +4882,7 @@ StopActiveLlama(*) {
 
     global ActiveLlamaStatus
     global FastPollRate
+    global LlamaProbeSuppressed
 
 
     SetActivePollRate(
@@ -4811,6 +4921,7 @@ StopActiveLlama(*) {
             )
         }
 
+        LlamaProbeSuppressed := true
         UpdateActiveState()
         return
     }
@@ -4884,6 +4995,7 @@ StopActiveLlama(*) {
         10000
     )
 
+    LlamaProbeSuppressed := true
     UpdateActiveState()
 }
 
@@ -4897,9 +5009,11 @@ StartActiveMcp(*) {
     global ActiveMcpConfig
     global ActiveMcpStatus
     global McpStartupUntil, McpStartupGrace
+    global McpProbeSuppressed
     global FastPollRate
 
     SetActivePollRate(FastPollRate)
+    McpProbeSuppressed := false
 
     Desired := GetSavedMcpConfig(
         ActiveModelKey
@@ -4909,6 +5023,7 @@ StartActiveMcp(*) {
         McpStartupUntil := 0
         ActiveMcpConfig := 0
         ActiveMcpDirectories := ""
+        McpProbeSuppressed := true
         UpdateActiveState()
         return
     }
@@ -4950,6 +5065,7 @@ StartActiveMcp(*) {
         McpStartupUntil := 0
         ActiveMcpConfig := 0
         ActiveMcpDirectories := ""
+        McpProbeSuppressed := true
         UpdateActiveState()
         return
     }
@@ -4967,6 +5083,7 @@ StartActiveMcp(*) {
         McpStartupUntil := 0
         ActiveMcpConfig := 0
         ActiveMcpDirectories := ""
+        McpProbeSuppressed := true
 
         MsgBox(
             "MCP could not be started:`n`n"
@@ -4996,6 +5113,7 @@ StopActiveMcp(*) {
     global ActiveMcpDirectories
     global ActiveMcpStatus
     global McpStartupUntil
+    global McpProbeSuppressed
     global FastPollRate
 
     SetActivePollRate(FastPollRate)
@@ -5014,6 +5132,7 @@ StopActiveMcp(*) {
         ActiveMcpConfig := 0
         ActiveMcpDirectories := ""
         McpStartupUntil := 0
+        McpProbeSuppressed := true
         UpdateActiveState()
         return
     }
@@ -5079,6 +5198,7 @@ StopActiveMcp(*) {
     ActiveMcpConfig := 0
     ActiveMcpDirectories := ""
     McpStartupUntil := 0
+    McpProbeSuppressed := true
     UpdateActiveState()
 }
 
@@ -5188,6 +5308,8 @@ ReturnToStartup() {
 
 	ActivePollRate := 0
 
+    UpdateMainModelInfo()
+
 	ShowRelative(
 		MainGui,
 		ActiveGui
@@ -5203,12 +5325,21 @@ ReturnToStartup() {
 GetEffectiveMcpDirectories(ModelKey := "") {
     global McpDirectories
     global Models
+    global ControllerMode
+    global ActiveModelKey
+    global ActiveModelMcpDirectories
 
     ModelDirectories := ""
 
-    if ModelKey != ""
-    && Models.Has(ModelKey)
+    if ControllerMode = "active"
+    && ModelKey != ""
+    && ModelKey = ActiveModelKey {
+        ModelDirectories := ActiveModelMcpDirectories
+    }
+    else if ModelKey != ""
+    && Models.Has(ModelKey) {
         ModelDirectories := Models[ModelKey].McpDirectories
+    }
 
     return MergeMcpDirectories(
         McpDirectories,
@@ -6341,14 +6472,68 @@ GetModelHealthURL(ModelKey, ServerKey := "") {
 ;  APPLICATION FUNCTIONS
 ; ============================================================
 
+AcquireInstanceMutex() {
+    Mutex := DllCall(
+        "Kernel32\CreateMutexW",
+        "ptr", 0,
+        "int", false,
+        "str", "Local\WinLlama_Controller_Instance",
+        "ptr"
+    )
+
+    if !Mutex {
+        MsgBox(
+            "WinLlama could not create its instance guard.",
+            "Local AI",
+            "Iconx"
+        )
+
+        return 0
+    }
+
+    if DllCall(
+        "Kernel32\GetLastError",
+        "uint"
+    ) = 183 {
+        Result := MsgBox(
+            "Another WinLlama controller is already running.`n`n"
+            . "Open a second instance anyway?",
+            "WinLlama Already Running",
+            "YesNo Icon?"
+        )
+
+        if Result != "Yes" {
+            DllCall(
+                "Kernel32\CloseHandle",
+                "ptr", Mutex
+            )
+
+            return 0
+        }
+    }
+
+    return Mutex
+}
+
+
 CleanupOwnedServices(ExitReason, ExitCode) {
     global LlamaPid, McpPid
+    global InstanceMutex
 
     if LlamaPid && ProcessExist(LlamaPid)
         StopProcessTree(LlamaPid)
 
     if McpPid && ProcessExist(McpPid)
         StopProcessTree(McpPid)
+
+    if InstanceMutex {
+        DllCall(
+            "Kernel32\CloseHandle",
+            "ptr", InstanceMutex
+        )
+
+        InstanceMutex := 0
+    }
 }
 
 SetActivePollRate(Rate) {
