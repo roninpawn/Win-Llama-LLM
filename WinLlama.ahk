@@ -96,6 +96,9 @@ LogsDirectory := ResolvePath(
 
 WebUI := "http://127.0.0.1:" LlamaPort
 
+MigrateLegacyServerConfiguration()
+
+Servers := LoadServers()
 Models := LoadModels()
 
 LlamaPid := 0
@@ -154,6 +157,150 @@ ConsoleMaxRate := 86400000
 
 DarkButtonFillOverrides := Map()
 
+; --------------- ----------- - -----TEMPORARY MIGRATION STUFF
+MigrateLegacyServerConfiguration() {
+    global ModelList
+    global ServerList
+    global LlamaPort
+
+    ServersByExecutable := Map()
+    ServerListChanged := false
+
+
+    ; --------------------------------------------------------
+    ;  INDEX ALREADY-REGISTERED SERVERS
+    ; --------------------------------------------------------
+
+    for ServerKey in ServerList {
+        Executable :=
+            ConfigRead(
+                ServerKey,
+                "Executable",
+                ""
+            )
+
+        if Executable = ""
+            continue
+
+        ServersByExecutable[
+            NormalizeConfigPath(
+                Executable
+            )
+        ] := ServerKey
+    }
+
+
+    ; --------------------------------------------------------
+    ;  MIGRATE LEGACY MODEL SERVER PATHS
+    ; --------------------------------------------------------
+
+    for ModelKey in ModelList {
+        ServerValue :=
+            Trim(
+                ConfigRead(
+                    ModelKey,
+                    "Server",
+                    ""
+                )
+            )
+
+        if ServerValue = ""
+            continue
+
+
+        ; Already a registered server key.
+        if ListContainsValue(
+            ServerList,
+            ServerValue
+        )
+            continue
+
+
+        ; An unknown non-path value is treated as a dangling
+        ; server reference, not something migration should invent.
+        if !LooksLikeConfigPath(
+            ServerValue
+        )
+            continue
+
+
+        ExecutableKey :=
+            NormalizeConfigPath(
+                ServerValue
+            )
+
+
+        ; ----------------------------------------------------
+        ;  REUSE AN EXISTING SERVER FOR THE SAME EXECUTABLE
+        ; ----------------------------------------------------
+
+        if ServersByExecutable.Has(
+            ExecutableKey
+        ) {
+            ServerKey :=
+                ServersByExecutable[
+                    ExecutableKey
+                ]
+        }
+
+
+        ; ----------------------------------------------------
+        ;  REGISTER A NEW SERVER
+        ; ----------------------------------------------------
+
+        else {
+            Name :=
+                DeriveServerName(
+                    ServerValue
+                )
+
+            ServerKey :=
+                GenerateConfigKey(
+                    Name,
+                    "Server"
+                )
+
+            ConfigWriteMany(
+                ServerKey,
+                Map(
+                    "Name", Name,
+                    "Executable", ServerValue,
+                    "Address", "127.0.0.1",
+                    "Port", LlamaPort,
+                    "Args", ""
+                )
+            )
+
+            ServerList.Push(
+                ServerKey
+            )
+
+            ServersByExecutable[
+                ExecutableKey
+            ] := ServerKey
+
+            ServerListChanged := true
+        }
+
+
+        ; Model now references the registered server.
+        ConfigWrite(
+            ModelKey,
+            "Server",
+            ServerKey
+        )
+    }
+
+
+    if ServerListChanged {
+        ConfigWriteList(
+            "General",
+            "ServerList",
+            ServerList
+        )
+    }
+}
+
 ; ============================================================
 ; CONFIG.INI API
 ; ============================================================
@@ -184,6 +331,64 @@ ConfigWrite(Section, Key, Value) {
 ConfigWriteMany(Section, Values) {
     for Key, Value in Values
         ConfigWrite(Section, Key, Value)
+}
+
+ListContainsValue(List, Value) {
+    Value := StrLower(
+        Trim(Value)
+    )
+
+    for Existing in List {
+        if StrLower(Existing) = Value
+            return true
+    }
+
+    return false
+}
+
+
+RemoveListValue(List, Value) {
+    Value := StrLower(
+        Trim(Value)
+    )
+
+    for Index, Existing in List {
+        if StrLower(Existing) != Value
+            continue
+
+        List.RemoveAt(Index)
+        return true
+    }
+
+    return false
+}
+
+
+LooksLikeConfigPath(Value) {
+    Value := Trim(Value)
+
+    if Value = ""
+        return false
+
+    return RegExMatch(
+        Value,
+        "i)^(?:[A-Z]:[\\/]|\\\\|//|\.[\\/])"
+    )
+        || InStr(Value, "\")
+        || InStr(Value, "/")
+}
+
+
+NormalizeConfigPath(Path) {
+    Path := Trim(Path)
+
+    return StrLower(
+        StrReplace(
+            Path,
+            "/",
+            "\"
+        )
+    )
 }
 
 
@@ -480,6 +685,32 @@ GenerateConfigKey(
     }
 
     return Candidate
+}
+
+DeriveServerName(Executable) {
+    SplitPath(
+        Executable,
+        &FileName,
+        &Directory,
+        &Extension,
+        &NameNoExt
+    )
+
+    if StrLower(NameNoExt) = "llama-server"
+    && Directory != "" {
+        SplitPath(
+            Directory,
+            &FolderName
+        )
+
+        if FolderName != ""
+            return FolderName
+    }
+
+    if NameNoExt != ""
+        return NameNoExt
+
+    return "Llama Server"
 }
 
 ; ============================================================
@@ -2923,10 +3154,42 @@ StartLlama(ModelKey, Context, Cache) {
 
 LoadModels() {
     global ModelList
+    global Servers
 
     Models := Map()
 
     for Key in ModelList {
+        ServerKey :=
+            ConfigRead(
+                Key,
+                "Server",
+                ""
+            )
+
+        ServerExecutable := ""
+
+
+        ; New registered-server configuration.
+        if Servers.Has(
+            ServerKey
+        ) {
+            ServerExecutable :=
+                Servers[
+                    ServerKey
+                ].Executable
+        }
+
+
+        ; Compatibility with any legacy path that migration
+        ; deliberately declined or was unable to convert.
+        else if LooksLikeConfigPath(
+            ServerKey
+        ) {
+            ServerExecutable :=
+                ServerKey
+        }
+
+
         Models[Key] := {
             Name: ConfigRead(
                 Key,
@@ -2934,14 +3197,17 @@ LoadModels() {
                 Key
             ),
 
-            Server: ConfigRead(
-                Key,
-                "Server"
-            ),
+            ; Temporary compatibility field:
+            ; existing runtime code still expects an executable.
+            Server: ServerExecutable,
+
+            ; Permanent new relationship.
+            ServerKey: ServerKey,
 
             Model: ConfigRead(
                 Key,
-                "Model"
+                "Model",
+                ""
             ),
 
             Context: ConfigReadInteger(
@@ -3983,6 +4249,188 @@ WaitForReady(URL, TimeoutMs) {
     }
 
     return false
+}
+
+; ============================================================
+;  SERVERS
+; ============================================================
+
+LoadServers() {
+    global ServerList
+
+    Servers := Map()
+
+    for Key in ServerList {
+        Servers[Key] := {
+            Name: ConfigRead(
+                Key,
+                "Name",
+                Key
+            ),
+
+            Executable: ConfigRead(
+                Key,
+                "Executable",
+                ""
+            ),
+
+            Address: ConfigRead(
+                Key,
+                "Address",
+                "127.0.0.1"
+            ),
+
+            Port: ConfigReadInteger(
+                Key,
+                "Port",
+                18080,
+                1,
+                65535
+            ),
+
+            Args: ConfigRead(
+                Key,
+                "Args",
+                ""
+            )
+        }
+    }
+
+    return Servers
+}
+
+SaveServer(
+    ServerKey,
+    Name,
+    Executable,
+    Address,
+    Port,
+    Args := ""
+) {
+    global Servers
+    global ServerList
+
+    Server := {
+        Name: Name,
+        Executable: Executable,
+        Address: Address,
+        Port: Port + 0,
+        Args: Args
+    }
+
+    ConfigWriteMany(
+        ServerKey,
+        Map(
+            "Name", Server.Name,
+            "Executable", Server.Executable,
+            "Address", Server.Address,
+            "Port", Server.Port,
+            "Args", Server.Args
+        )
+    )
+
+    if !ListContainsValue(
+        ServerList,
+        ServerKey
+    ) {
+        ServerList.Push(
+            ServerKey
+        )
+
+        ConfigWriteList(
+            "General",
+            "ServerList",
+            ServerList
+        )
+    }
+
+    Servers[
+        ServerKey
+    ] := Server
+
+    return ServerKey
+}
+
+
+AddServer(
+    Name,
+    Executable,
+    Address := "127.0.0.1",
+    Port := 18080,
+    Args := ""
+) {
+    ServerKey :=
+        GenerateConfigKey(
+            Name,
+            "Server"
+        )
+
+    return SaveServer(
+        ServerKey,
+        Name,
+        Executable,
+        Address,
+        Port,
+        Args
+    )
+}
+
+
+DeleteServer(ServerKey) {
+    global Servers
+    global ServerList
+
+    if !ListContainsValue(
+        ServerList,
+        ServerKey
+    )
+        return false
+
+    ConfigDeleteSection(
+        ServerKey
+    )
+
+    RemoveListValue(
+        ServerList,
+        ServerKey
+    )
+
+    ConfigWriteList(
+        "General",
+        "ServerList",
+        ServerList
+    )
+
+    if Servers.Has(
+        ServerKey
+    )
+        Servers.Delete(
+            ServerKey
+        )
+
+    return true
+}
+
+ServerExists(ServerKey) {
+    global Servers
+
+    return Servers.Has(
+        ServerKey
+    )
+}
+
+
+GetServer(ServerKey) {
+    global Servers
+
+    if !Servers.Has(
+        ServerKey
+    )
+        return false
+
+    return Servers[
+        ServerKey
+    ]
 }
 
 ; ============================================================
