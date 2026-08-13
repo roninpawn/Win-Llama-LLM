@@ -138,7 +138,7 @@ MigrateLegacyServerConfiguration()
 
 Servers := LoadServers()
 Models := LoadModels()
-SetupNeeds := GetConfigurationSetupNeeds()
+NeedsSetup := ConfigurationNeedsSetup()
 
 LlamaPid := 0
 McpPid := 0
@@ -212,12 +212,8 @@ ConsoleMaxRate := 86400000
 
 DarkButtonFillOverrides := Map()
 
-SetupGui := 0
-
-if SetupNeeds.Required {
-    OpenSetupRequiredWindow(SetupNeeds)
-    return
-}
+SetupHostGui := 0
+SetupSelectedModelKey := ""
 
 ; --------------- ----------- - -----TEMPORARY MIGRATION STUFF
 MigrateLegacyServerConfiguration() {
@@ -390,98 +386,230 @@ EnsureConfigFile() {
 }
 
 
-GetConfigurationSetupNeeds() {
-    global Servers, ServerList
-    global Models, ModelList
+ConfigurationNeedsSetup() {
+    global ServerList
+    global ModelList
 
     HasServer := false
 
     for ServerKey in ServerList {
-        if !Servers.Has(ServerKey)
-            continue
-
-        Server := Servers[ServerKey]
-
-        ; File existence is deliberately NOT part of structural validity.
-        ; A configured path that later goes stale is a runtime problem.
-        if Trim(Server.Executable) = ""
-            continue
-
-        HasServer := true
-        break
+        if IsStructurallyValidServer(ServerKey) {
+            HasServer := true
+            break
+        }
     }
 
-    HasModel := false
+    if !HasServer
+        return true
 
     for ModelKey in ModelList {
-        if !Models.Has(ModelKey)
-            continue
-
-        Model := Models[ModelKey]
-
-        if Trim(Model.Model) = ""
-        || Trim(Model.ServerKey) = ""
-        || !Servers.Has(Model.ServerKey)
-            continue
-
-        HasModel := true
-        break
+        if IsStructurallyValidModel(ModelKey)
+            return false
     }
 
-    return {
-        Required: !HasServer || !HasModel,
-        NeedsServer: !HasServer,
-        NeedsModel: !HasModel
-    }
+    return true
 }
 
 
-OpenSetupRequiredWindow(Needs) {
-    global SetupGui
-    global BaseColor, TextColor, MutedColor
+IsStructurallyValidServer(ServerKey) {
+    global Servers
 
-    SetupGui := Gui(, "WinLlama Setup")
-    SetupGui.BackColor := BaseColor
-    SetupGui.MarginX := 26
-    SetupGui.MarginY := 22
-    ApplyDarkWindow(SetupGui)
+    return ServerKey != ""
+        && Servers.Has(ServerKey)
+        && Trim(Servers[ServerKey].Executable) != ""
+}
 
-    SetupGui.SetFont("s16 Bold c" TextColor, "Segoe UI")
-    SetupGui.AddText("xm w500 Center", "SETUP REQUIRED")
 
-    SetupGui.SetFont("s11 Norm c" TextColor, "Segoe UI")
-    SetupGui.AddText(
-        "xm y+24 w500",
-        "WinLlama needs a registered llama server and model before the controller can start."
+IsStructurallyValidModel(ModelKey) {
+    global Models, Servers
+
+    if ModelKey = "" || !Models.Has(ModelKey)
+        return false
+
+    Model := Models[ModelKey]
+
+    return Trim(Model.Model) != ""
+        && Trim(Model.ServerKey) != ""
+        && IsStructurallyValidServer(Model.ServerKey)
+}
+
+
+StartSetupSequence() {
+    global ControllerMode
+    global SetupHostGui
+
+    ControllerMode := "setup"
+
+    if !IsObject(SetupHostGui) {
+        SetupHostGui := Gui("+ToolWindow", "WinLlama Setup")
+        SetupHostGui.Show("Hide w552 h420 Center")
+    }
+
+    OpenServerManager(
+        SetupHostGui,
+        "",
+        0,
+        true,
+        ContinueSetupFromServer
+    )
+}
+
+
+ContinueSetupFromServer(ServerKey) {
+    global SetupHostGui
+
+    OpenModelConfigEditor(
+        SetupHostGui,
+        GetSetupPreferredModelKey(),
+        "",
+        "",
+        ServerKey,
+        "setup"
+    )
+}
+
+
+GetSetupPreferredModelKey() {
+    global LastModel
+    global ModelList, Models
+
+    if LastModel != "" && Models.Has(LastModel)
+        return LastModel
+
+    for ModelKey in ModelList {
+        if Models.Has(ModelKey)
+            return ModelKey
+    }
+
+    return ""
+}
+
+
+ContinueSetupFromModel(EditorGui, ParentGui, ModelPanel) {
+    global Models, Servers
+    global SetupSelectedModelKey
+
+    Values := ModelPanel.GetValues()
+
+    if !Values
+        return
+
+    if !IsStructurallyValidServer(Values.ServerKey) {
+        MsgBox(
+            "Select a registered llama server for this model.",
+            "WinLlama Setup",
+            "Icon!"
+        )
+        return
+    }
+
+    if !Models.Has(Values.ModelKey)
+    || Trim(Models[Values.ModelKey].Model) = "" {
+        MsgBox(
+            "Select or add a model with a configured GGUF location.",
+            "WinLlama Setup",
+            "Icon!"
+        )
+        return
+    }
+
+    SaveModelDefaults(
+        Values.ModelKey,
+        Values.ServerKey,
+        Values.Context,
+        Values.Cache,
+        Values.McpDirectories
     )
 
-    Missing := ""
+    SaveLastModel(Values.ModelKey)
+    SetupSelectedModelKey := Values.ModelKey
 
-    if Needs.NeedsServer
-        Missing .= "• Llama server registration`n"
-
-    if Needs.NeedsModel
-        Missing .= "• Model registration`n"
-
-    SetupGui.SetFont("s11 c" MutedColor, "Segoe UI")
-    SetupGui.AddText(
-        "xm y+18 w500 h54",
-        "Configuration still required:`n" Missing
+    EndConfigDialog(
+        EditorGui,
+        ParentGui,
+        false
     )
 
-    SetupGui.SetFont("s10 c" MutedColor, "Segoe UI")
-    SetupGui.AddText(
-        "xm y+12 w500",
-        "The first-run setup workflow will continue from this state."
+    OpenSetupMcpStep()
+}
+
+
+OpenSetupMcpStep() {
+    global SetupHostGui
+
+    OpenMcpConfigEditor(
+        SetupHostGui,
+        false,
+        true
+    )
+}
+
+
+SaveSetupMcpAndContinue(EditorGui, ParentGui, McpPanel) {
+    if !SaveMcpEditorConfig(McpPanel)
+        return
+
+    EndConfigDialog(
+        EditorGui,
+        ParentGui,
+        false
     )
 
-    SetupGui.SetFont("s12 c" TextColor, "Segoe UI")
-    ExitButton := SetupGui.AddButton("xm y+22 w500 h42", "Exit")
-    MakeOwnerDrawButton(ExitButton)
+    FinishSetupSequence()
+}
 
-    ExitButton.OnEvent("Click", (*) => ExitApp())
-    SetupGui.OnEvent("Close", (*) => ExitApp())
-    SetupGui.Show("w552")
+
+SkipSetupMcp(EditorGui, ParentGui) {
+    EndConfigDialog(
+        EditorGui,
+        ParentGui,
+        false
+    )
+
+    FinishSetupSequence()
+}
+
+
+FinishSetupSequence() {
+    global ControllerMode
+    global NeedsSetup
+    global SetupHostGui
+    global SetupSelectedModelKey
+    global MainGui
+    global LastModel
+    global ModelList, Models
+
+    if ConfigurationNeedsSetup() {
+        MsgBox(
+            "WinLlama still needs a registered llama server and model before setup can finish.",
+            "WinLlama Setup",
+            "Icon!"
+        )
+
+        StartSetupSequence()
+        return
+    }
+
+    if IsObject(SetupHostGui) {
+        try SetupHostGui.Destroy()
+        SetupHostGui := 0
+    }
+
+    ControllerMode := "start"
+    NeedsSetup := false
+
+    PreferredModelKey := SetupSelectedModelKey
+
+    if PreferredModelKey = "" || !Models.Has(PreferredModelKey) {
+        PreferredModelKey := LastModel != "" && Models.Has(LastModel)
+            ? LastModel
+            : ModelList[1]
+    }
+
+    RefreshMainModelControl(PreferredModelKey)
+    UpdateMainModelInfo()
+    MainGui.Show("w572")
+    WinActivate("ahk_id " MainGui.Hwnd)
 }
 
 
@@ -1011,19 +1139,28 @@ MainGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
 MainGui.AddText("xm y+24", "Model")
 
 ModelNames := []
-InitialIndex := 1
+InitialIndex := 0
+InitialModelKey := ""
 
-InitialModelKey :=
-    LastModel != ""
-    && Models.Has(LastModel)
-        ? LastModel
-        : ModelList[1]
+if ModelList.Length {
+    InitialModelKey :=
+        LastModel != ""
+        && Models.Has(LastModel)
+            ? LastModel
+            : ModelList[1]
 
-for Index, Key in ModelList {
-    ModelNames.Push(Models[Key].Name)
+    for Index, Key in ModelList {
+        if !Models.Has(Key)
+            continue
 
-    if Key = InitialModelKey
-        InitialIndex := Index
+        ModelNames.Push(Models[Key].Name)
+
+        if Key = InitialModelKey
+            InitialIndex := ModelNames.Length
+    }
+
+    if !InitialIndex && ModelNames.Length
+        InitialIndex := 1
 }
 
 MainModelControl := MainGui.AddDropDownList(
@@ -1031,7 +1168,9 @@ MainModelControl := MainGui.AddDropDownList(
     ModelNames
 )
 
-MainModelControl.Choose(InitialIndex)
+if InitialIndex
+    MainModelControl.Choose(InitialIndex)
+
 ApplyDarkControl(MainModelControl)
 
 BuildActiveGui()
@@ -1108,7 +1247,10 @@ MainGui.OnEvent("Close", HideController)
 
 UpdateMainModelInfo()
 
-MainGui.Show("w572")
+if NeedsSetup
+    StartSetupSequence()
+else
+    MainGui.Show("w572")
 
 
 ; ============================================================
@@ -2053,12 +2195,15 @@ OpenModelConfigEditor(
     global BaseColor, TextColor
 
     IsStartMode := ActionMode = "start"
+    IsSetupMode := ActionMode = "setup"
 
     EditorGui := Gui(
         ,
         IsStartMode
             ? "Configure Session"
-            : "Model Settings"
+            : IsSetupMode
+                ? "WinLlama Setup - Model"
+                : "Model Settings"
     )
 
     if !BeginConfigDialog(
@@ -2082,7 +2227,9 @@ OpenModelConfigEditor(
         "xm w480 Center",
         IsStartMode
             ? "CONFIGURE SESSION"
-            : "MODEL SETTINGS"
+            : IsSetupMode
+                ? "MODEL CONFIGURATION"
+                : "MODEL SETTINGS"
     )
 
     ModelPanel := ModelConfigPanel(
@@ -2101,68 +2248,104 @@ OpenModelConfigEditor(
         "Segoe UI"
     )
 
-    PrimaryButton := EditorGui.AddButton(
-        "x24 y" ModelPanel.Bottom + 22
-        . " w150 h42",
-        IsStartMode ? "Start" : "Apply"
-    )
+    if IsSetupMode {
+        ContinueButton := EditorGui.AddButton(
+            "x24 y" ModelPanel.Bottom + 22
+            . " w230 h42",
+            "Continue"
+        )
 
-    SaveDefaultsButton := EditorGui.AddButton(
-        "x189 yp w150 h42",
-        "Save Defaults"
-    )
+        ExitButton := EditorGui.AddButton(
+            "x274 yp w230 h42",
+            "Exit"
+        )
 
-    CancelButton := EditorGui.AddButton(
-        "x354 yp w150 h42",
-        "Cancel"
-    )
+        MakeOwnerDrawButton(ContinueButton)
+        MakeOwnerDrawButton(ExitButton)
 
-    MakeOwnerDrawButton(PrimaryButton)
-    MakeOwnerDrawButton(SaveDefaultsButton)
-    MakeOwnerDrawButton(CancelButton)
-
-    if IsStartMode {
-        PrimaryButton.OnEvent(
+        ContinueButton.OnEvent(
             "Click",
-            (*) => StartModelSession(
+            (*) => ContinueSetupFromModel(
                 EditorGui,
                 ParentGui,
                 ModelPanel
             )
         )
+
+        ExitButton.OnEvent(
+            "Click",
+            (*) => ExitApp()
+        )
+
+        EditorGui.OnEvent(
+            "Close",
+            (*) => ExitApp()
+        )
     }
     else {
-        PrimaryButton.OnEvent(
+        PrimaryButton := EditorGui.AddButton(
+            "x24 y" ModelPanel.Bottom + 22
+            . " w150 h42",
+            IsStartMode ? "Start" : "Apply"
+        )
+
+        SaveDefaultsButton := EditorGui.AddButton(
+            "x189 yp w150 h42",
+            "Save Defaults"
+        )
+
+        CancelButton := EditorGui.AddButton(
+            "x354 yp w150 h42",
+            "Cancel"
+        )
+
+        MakeOwnerDrawButton(PrimaryButton)
+        MakeOwnerDrawButton(SaveDefaultsButton)
+        MakeOwnerDrawButton(CancelButton)
+
+        if IsStartMode {
+            PrimaryButton.OnEvent(
+                "Click",
+                (*) => StartModelSession(
+                    EditorGui,
+                    ParentGui,
+                    ModelPanel
+                )
+            )
+        }
+        else {
+            PrimaryButton.OnEvent(
+                "Click",
+                (*) => ApplyModelConfig(
+                    EditorGui,
+                    ModelPanel
+                )
+            )
+        }
+
+        SaveDefaultsButton.OnEvent(
             "Click",
-            (*) => ApplyModelConfig(
-                EditorGui,
+            (*) => SaveModelEditorDefaults(
                 ModelPanel
             )
         )
+
+        CancelButton.OnEvent(
+            "Click",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
+
+        EditorGui.OnEvent(
+            "Close",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
     }
-
-    SaveDefaultsButton.OnEvent(
-        "Click",
-        (*) => SaveModelEditorDefaults(
-            ModelPanel
-        )
-    )
-
-    CancelButton.OnEvent(
-        "Click",
-        (*) => EndConfigDialog(
-            EditorGui,
-            ParentGui
-        )
-    )
-
-    EditorGui.OnEvent(
-        "Close",
-        (*) => EndConfigDialog(
-            EditorGui,
-            ParentGui
-        )
-    )
 
     ShowRelative(
         EditorGui,
@@ -2688,14 +2871,16 @@ OpenMcpEditor(*) {
 }
 
 
-OpenMcpConfigEditor(ParentGui, AllowApply := false) {
+OpenMcpConfigEditor(ParentGui, AllowApply := false, SetupMode := false) {
     global McpEnabled, McpAddress, McpPort
     global McpDirectories
     global BaseColor, TextColor
 
     EditorGui := Gui(
         ,
-        "MCP Access"
+        SetupMode
+            ? "WinLlama Setup - MCP"
+            : "MCP Access"
     )
 
     if !BeginConfigDialog(
@@ -2717,7 +2902,9 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false) {
 
     EditorGui.AddText(
         "xm w480 Center",
-        "MCP ACCESS"
+        SetupMode
+            ? "MCP ACCESS (OPTIONAL)"
+            : "MCP ACCESS"
     )
 
     McpPanel := McpConfigPanel(
@@ -2736,7 +2923,44 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false) {
         "Segoe UI"
     )
 
-    if AllowApply {
+    if SetupMode {
+        SaveButton := EditorGui.AddButton(
+            "x24 y" McpPanel.Bottom + 22
+            . " w230 h42",
+            "Save & Continue"
+        )
+
+        SkipButton := EditorGui.AddButton(
+            "x274 yp w230 h42",
+            "Skip"
+        )
+
+        MakeOwnerDrawButton(SaveButton)
+        MakeOwnerDrawButton(SkipButton)
+
+        SaveButton.OnEvent(
+            "Click",
+            (*) => SaveSetupMcpAndContinue(
+                EditorGui,
+                ParentGui,
+                McpPanel
+            )
+        )
+
+        SkipButton.OnEvent(
+            "Click",
+            (*) => SkipSetupMcp(
+                EditorGui,
+                ParentGui
+            )
+        )
+
+        EditorGui.OnEvent(
+            "Close",
+            (*) => ExitApp()
+        )
+    }
+    else if AllowApply {
         SaveButton := EditorGui.AddButton(
             "x24 y" McpPanel.Bottom + 22
             . " w150 h42",
@@ -2774,6 +2998,22 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false) {
                 McpPanel
             )
         )
+
+        CancelButton.OnEvent(
+            "Click",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
+
+        EditorGui.OnEvent(
+            "Close",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
     }
     else {
         SaveButton := EditorGui.AddButton(
@@ -2798,23 +3038,23 @@ OpenMcpConfigEditor(ParentGui, AllowApply := false) {
                 McpPanel
             )
         )
+
+        CancelButton.OnEvent(
+            "Click",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
+
+        EditorGui.OnEvent(
+            "Close",
+            (*) => EndConfigDialog(
+                EditorGui,
+                ParentGui
+            )
+        )
     }
-
-    EditorGui.OnEvent(
-        "Close",
-        (*) => EndConfigDialog(
-            EditorGui,
-            ParentGui
-        )
-    )
-
-    CancelButton.OnEvent(
-        "Click",
-        (*) => EndConfigDialog(
-            EditorGui,
-            ParentGui
-        )
-    )
 
     ShowRelative(
         EditorGui,
@@ -6114,7 +6354,13 @@ WaitForReady(URL, TimeoutMs) {
 ;  LLAMA SERVER MANAGEMENT UI
 ; ============================================================
 
-OpenServerManager(ParentGui, SelectedServerKey := "", OnChanged := 0) {
+OpenServerManager(
+    ParentGui,
+    SelectedServerKey := "",
+    OnChanged := 0,
+    SetupMode := false,
+    OnContinue := 0
+) {
     global ServerManagerState
     global BaseColor, TextColor, MutedColor
 
@@ -6128,7 +6374,13 @@ OpenServerManager(ParentGui, SelectedServerKey := "", OnChanged := 0) {
             ServerManagerState := 0
     }
 
-    ManagerGui := Gui(, "Llama Servers")
+    ManagerGui := Gui(
+        ,
+        SetupMode
+            ? "WinLlama Setup - Llama Servers"
+            : "Llama Servers"
+    )
+
     ManagerGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
     ParentGui.Opt("+Disabled")
     ManagerGui.BackColor := BaseColor
@@ -6158,16 +6410,36 @@ OpenServerManager(ParentGui, SelectedServerKey := "", OnChanged := 0) {
     ManagerGui.SetFont("s10 c" MutedColor, "Segoe UI")
     SummaryText := ManagerGui.AddText("x24 y143 w480 h50", "")
 
+    ContinueButton := 0
+
+    if SetupMode {
+        ManagerGui.SetFont("s12 c" TextColor, "Segoe UI")
+        ContinueButton := ManagerGui.AddButton("x24 y211 w480 h42", "Continue")
+        MakeOwnerDrawButton(ContinueButton)
+    }
+
     ServerManagerState := {
-        Gui: ManagerGui, Parent: ParentGui, ServerControl: ServerControl, ServerKeys: [],
-        SummaryText: SummaryText, EditButton: EditButton, DeleteButton: DeleteButton,
-        OnChanged: OnChanged
+        Gui: ManagerGui,
+        Parent: ParentGui,
+        ServerControl: ServerControl,
+        ServerKeys: [],
+        SummaryText: SummaryText,
+        EditButton: EditButton,
+        DeleteButton: DeleteButton,
+        ContinueButton: ContinueButton,
+        SetupMode: SetupMode,
+        OnChanged: OnChanged,
+        OnContinue: OnContinue
     }
 
     ServerControl.OnEvent("Change", UpdateServerManagerDetails)
     EditButton.OnEvent("Click", EditSelectedServer)
     AddButton.OnEvent("Click", (*) => OpenServerEditor(ManagerGui))
     DeleteButton.OnEvent("Click", DeleteSelectedServer)
+
+    if SetupMode
+        ContinueButton.OnEvent("Click", ContinueServerSetup)
+
     ManagerGui.OnEvent("Close", CloseServerManager)
 
     RefreshServerManager(SelectedServerKey)
@@ -6181,13 +6453,57 @@ CloseServerManager(*) {
     if !IsObject(ServerManagerState)
         return
 
+    if ServerManagerState.SetupMode {
+        ExitApp()
+        return
+    }
+
+    DismissServerManager()
+}
+
+
+DismissServerManager(ShowParent := true) {
+    global ServerManagerState
+
+    if !IsObject(ServerManagerState)
+        return
+
     State := ServerManagerState
     try State.Gui.Destroy()
     ServerManagerState := 0
 
     State.Parent.Opt("-Disabled")
-    State.Parent.Show()
-    try WinActivate("ahk_id " State.Parent.Hwnd)
+
+    if ShowParent {
+        State.Parent.Show()
+        try WinActivate("ahk_id " State.Parent.Hwnd)
+    }
+}
+
+
+ContinueServerSetup(*) {
+    global ServerManagerState
+
+    if !IsObject(ServerManagerState)
+        return
+
+    ServerKey := GetSelectedServerManagerKey()
+
+    if !IsStructurallyValidServer(ServerKey) {
+        MsgBox(
+            "Select or register a llama server before continuing.",
+            "WinLlama Setup",
+            "Icon!"
+        )
+        return
+    }
+
+    Callback := ServerManagerState.OnContinue
+
+    DismissServerManager(false)
+
+    if IsObject(Callback)
+        Callback.Call(ServerKey)
 }
 
 
@@ -6258,6 +6574,10 @@ UpdateServerManagerDetails(*) {
         State.SummaryText.Text := "No llama servers are registered."
         State.EditButton.Enabled := false
         State.DeleteButton.Enabled := false
+
+        if IsObject(State.ContinueButton)
+            State.ContinueButton.Enabled := false
+
         return
     }
 
@@ -6265,6 +6585,9 @@ UpdateServerManagerDetails(*) {
     State.SummaryText.Text := Server.Address ":" Server.Port "`n" Server.Executable
     State.EditButton.Enabled := true
     State.DeleteButton.Enabled := true
+
+    if IsObject(State.ContinueButton)
+        State.ContinueButton.Enabled := IsStructurallyValidServer(ServerKey)
 }
 
 
@@ -6940,6 +7263,25 @@ HideController(GuiObj, *) {
 ShowController(*) {
     global ControllerMode
     global MainGui, ActiveGui
+    global ActiveConfigDialog
+    global ServerManagerState
+
+    if ControllerMode = "setup" {
+        if IsObject(ActiveConfigDialog) {
+            RaiseConfigDialog()
+            return
+        }
+
+        if IsObject(ServerManagerState) {
+            try {
+                ServerManagerState.Gui.Show()
+                WinActivate("ahk_id " ServerManagerState.Gui.Hwnd)
+            }
+            return
+        }
+
+        return
+    }
 
     if ControllerMode = "active"
         Window := ActiveGui
