@@ -38,15 +38,7 @@ OnMessage(0x0134, DarkListBox)       ; WM_CTLCOLORLISTBOX
 ; ============================================================
 
 ConfigFile := A_ScriptDir "\config.ini"
-
-if !FileExist(ConfigFile) {
-    MsgBox(
-        "Configuration file not found:`n`n" ConfigFile,
-        "Local AI",
-        "Iconx"
-    )
-    ExitApp
-}
+EnsureConfigFile()
 
 ModelList := ConfigReadList(
     "General",
@@ -146,6 +138,7 @@ MigrateLegacyServerConfiguration()
 
 Servers := LoadServers()
 Models := LoadModels()
+SetupNeeds := GetConfigurationSetupNeeds()
 
 LlamaPid := 0
 McpPid := 0
@@ -218,6 +211,13 @@ ConsoleMinRate := 100
 ConsoleMaxRate := 86400000
 
 DarkButtonFillOverrides := Map()
+
+SetupGui := 0
+
+if SetupNeeds.Required {
+    OpenSetupRequiredWindow(SetupNeeds)
+    return
+}
 
 ; --------------- ----------- - -----TEMPORARY MIGRATION STUFF
 MigrateLegacyServerConfiguration() {
@@ -362,6 +362,128 @@ MigrateLegacyServerConfiguration() {
         )
     }
 }
+
+; ============================================================
+;  CONFIGURATION BOOTSTRAP
+; ============================================================
+
+EnsureConfigFile() {
+    global ConfigFile
+
+    if FileExist(ConfigFile)
+        return false
+
+    Template :=
+        "[General]`r`n"
+        . "ModelList=`r`n"
+        . "ServerList=`r`n"
+        . "LogsDirectory=Logs`r`n`r`n"
+        . "[State]`r`n`r`n"
+        . "[MCP]`r`n"
+        . "Enabled=false`r`n"
+        . "Address=127.0.0.1`r`n"
+        . "Port=18081`r`n"
+        . "GlobalDirectories=`r`n"
+
+    FileAppend(Template, ConfigFile, "UTF-8")
+    return true
+}
+
+
+GetConfigurationSetupNeeds() {
+    global Servers, ServerList
+    global Models, ModelList
+
+    HasServer := false
+
+    for ServerKey in ServerList {
+        if !Servers.Has(ServerKey)
+            continue
+
+        Server := Servers[ServerKey]
+
+        ; File existence is deliberately NOT part of structural validity.
+        ; A configured path that later goes stale is a runtime problem.
+        if Trim(Server.Executable) = ""
+            continue
+
+        HasServer := true
+        break
+    }
+
+    HasModel := false
+
+    for ModelKey in ModelList {
+        if !Models.Has(ModelKey)
+            continue
+
+        Model := Models[ModelKey]
+
+        if Trim(Model.Model) = ""
+        || Trim(Model.ServerKey) = ""
+        || !Servers.Has(Model.ServerKey)
+            continue
+
+        HasModel := true
+        break
+    }
+
+    return {
+        Required: !HasServer || !HasModel,
+        NeedsServer: !HasServer,
+        NeedsModel: !HasModel
+    }
+}
+
+
+OpenSetupRequiredWindow(Needs) {
+    global SetupGui
+    global BaseColor, TextColor, MutedColor
+
+    SetupGui := Gui(, "WinLlama Setup")
+    SetupGui.BackColor := BaseColor
+    SetupGui.MarginX := 26
+    SetupGui.MarginY := 22
+    ApplyDarkWindow(SetupGui)
+
+    SetupGui.SetFont("s16 Bold c" TextColor, "Segoe UI")
+    SetupGui.AddText("xm w500 Center", "SETUP REQUIRED")
+
+    SetupGui.SetFont("s11 Norm c" TextColor, "Segoe UI")
+    SetupGui.AddText(
+        "xm y+24 w500",
+        "WinLlama needs a registered llama server and model before the controller can start."
+    )
+
+    Missing := ""
+
+    if Needs.NeedsServer
+        Missing .= "• Llama server registration`n"
+
+    if Needs.NeedsModel
+        Missing .= "• Model registration`n"
+
+    SetupGui.SetFont("s11 c" MutedColor, "Segoe UI")
+    SetupGui.AddText(
+        "xm y+18 w500 h54",
+        "Configuration still required:`n" Missing
+    )
+
+    SetupGui.SetFont("s10 c" MutedColor, "Segoe UI")
+    SetupGui.AddText(
+        "xm y+12 w500",
+        "The first-run setup workflow will continue from this state."
+    )
+
+    SetupGui.SetFont("s12 c" TextColor, "Segoe UI")
+    ExitButton := SetupGui.AddButton("xm y+22 w500 h42", "Exit")
+    MakeOwnerDrawButton(ExitButton)
+
+    ExitButton.OnEvent("Click", (*) => ExitApp())
+    SetupGui.OnEvent("Close", (*) => ExitApp())
+    SetupGui.Show("w552")
+}
+
 
 ; ============================================================
 ; CONFIG.INI API
@@ -1108,12 +1230,17 @@ class ModelConfigPanel {
         GuiObj.AddText("x" X " y" Y, "Llama server")
         Y += 29
 
-        this.ServerControl := GuiObj.AddDropDownList("x" X " y" Y " w" (Width - 34) " +0x210", [])
+        this.ServerControl := GuiObj.AddDropDownList("x" X " y" Y " w" (Width - 98) " +0x210", [])
         ApplyDarkControl(this.ServerControl)
 
         GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
-        this.ServerManagerButton := GuiObj.AddButton("x+8 yp w26 h26", "…")
-        MakeOwnerDrawButton(this.ServerManagerButton)
+        this.EditServerButton := GuiObj.AddButton("x+8 yp w26 h26", "…")
+        this.AddServerButton := GuiObj.AddButton("x+6 yp w26 h26", "+")
+        GuiObj.SetFont("s13 c" TextColor, "Segoe UI")
+        this.DeleteServerButton := GuiObj.AddButton("x+6 yp w26 h26", "×")
+        MakeOwnerDrawButton(this.EditServerButton)
+        MakeOwnerDrawButton(this.AddServerButton)
+        MakeOwnerDrawButton(this.DeleteServerButton)
 
         Y += 50
         GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
@@ -1156,9 +1283,12 @@ class ModelConfigPanel {
         this.Bottom := Y + 38
 
         this.ModelControl.OnEvent("Change", ObjBindMethod(this, "ResetToModelDefaults"))
+        this.ServerControl.OnEvent("Change", ObjBindMethod(this, "UpdateServerButtons"))
         this.AddModelButton.OnEvent("Click", ObjBindMethod(this, "OpenAddModel"))
         this.DeleteModelButton.OnEvent("Click", ObjBindMethod(this, "DeleteSelectedModel"))
-        this.ServerManagerButton.OnEvent("Click", ObjBindMethod(this, "OpenServerManager"))
+        this.EditServerButton.OnEvent("Click", ObjBindMethod(this, "EditSelectedServer"))
+        this.AddServerButton.OnEvent("Click", ObjBindMethod(this, "AddServer"))
+        this.DeleteServerButton.OnEvent("Click", ObjBindMethod(this, "DeleteSelectedServer"))
 
         this.RefreshModels(ModelKey, false)
         this.SetValues(ModelKey, Context, Cache, ServerKey)
@@ -1239,6 +1369,18 @@ class ModelConfigPanel {
             SelectedIndex := 1
 
         this.ServerControl.Choose(SelectedIndex)
+        this.UpdateServerButtons()
+    }
+
+
+    UpdateServerButtons(*) {
+        global Servers
+
+        ServerKey := this.GetServerKey()
+        Registered := ServerKey != "" && Servers.Has(ServerKey)
+
+        this.EditServerButton.Enabled := Registered
+        this.DeleteServerButton.Enabled := Registered
     }
 
 
@@ -1365,7 +1507,7 @@ class ModelConfigPanel {
 
         if ModelList.Length <= 1 {
             MsgBox(
-                "At least one registered model must remain until first-run Setup is added.",
+                "At least one registered model must remain.",
                 "Delete Model",
                 "Icon!"
             )
@@ -1400,14 +1542,50 @@ class ModelConfigPanel {
     }
 
 
-    OpenServerManager(*) {
-        OpenServerManager(this.Gui, this.GetServerKey(), ObjBindMethod(this, "ServerRegistryChanged"))
+    EditSelectedServer(*) {
+        global Servers
+
+        ServerKey := this.GetServerKey()
+        if ServerKey = "" || !Servers.Has(ServerKey)
+            return
+
+        OpenServerEditor(
+            this.Gui,
+            ServerKey,
+            ObjBindMethod(this, "ServerRegistryChanged")
+        )
     }
 
 
-    ServerRegistryChanged(*) {
-        CurrentServerKey := this.GetServerKey()
-        this.RefreshServers(CurrentServerKey)
+    AddServer(*) {
+        OpenServerEditor(
+            this.Gui,
+            "",
+            ObjBindMethod(this, "ServerRegistryChanged")
+        )
+    }
+
+
+    DeleteSelectedServer(*) {
+        ServerKey := this.GetServerKey()
+        if ServerKey = ""
+            return
+
+        if !ConfirmDeleteServer(ServerKey)
+            return
+
+        ; Preserve the deleted key in the selector as [Missing] when the
+        ; current model/session still references it.
+        this.RefreshServers(ServerKey)
+        this.UpdateDefaultsText()
+    }
+
+
+    ServerRegistryChanged(ServerKey := "") {
+        if ServerKey = ""
+            ServerKey := this.GetServerKey()
+
+        this.RefreshServers(ServerKey)
         this.UpdateDefaultsText()
     }
 }
@@ -1679,7 +1857,7 @@ BuildActiveGui() {
     ActiveGui.SetFont("s10 c" MutedColor,"Segoe UI")
 
     ActiveLlamaDetails := ActiveGui.AddText(
-        "xm+113 y+4 w407 h24",
+        "xm+113 y+4 w407 h42",
         ""
     )
 
@@ -2239,12 +2417,17 @@ OpenAddModelDialog(ParentGui, OnSaved := 0) {
 
     DialogGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
     DialogGui.AddText("x24 y220", "Llama server")
-    ServerControl := DialogGui.AddDropDownList("x24 y249 w446 +0x210", [])
+    ServerControl := DialogGui.AddDropDownList("x24 y249 w382 +0x210", [])
     ApplyDarkControl(ServerControl)
 
     DialogGui.SetFont("s11 c" TextColor, "Segoe UI")
-    ServerManagerButton := DialogGui.AddButton("x478 yp w26 h26", "…")
-    MakeOwnerDrawButton(ServerManagerButton)
+    EditServerButton := DialogGui.AddButton("x414 yp w26 h26", "…")
+    AddServerButton := DialogGui.AddButton("x446 yp w26 h26", "+")
+    DialogGui.SetFont("s13 c" TextColor, "Segoe UI")
+    DeleteServerButton := DialogGui.AddButton("x478 yp w26 h26", "×")
+    MakeOwnerDrawButton(EditServerButton)
+    MakeOwnerDrawButton(AddServerButton)
+    MakeOwnerDrawButton(DeleteServerButton)
 
     DialogGui.SetFont("s10 c" MutedColor, "Segoe UI")
     DialogGui.AddText(
@@ -2265,14 +2448,16 @@ OpenAddModelDialog(ParentGui, OnSaved := 0) {
         NameEdit: NameEdit,
         ModelPathEdit: ModelPathEdit,
         ServerControl: ServerControl,
-        ServerKeys: []
+        ServerKeys: [],
+        EditServerButton: EditServerButton,
+        DeleteServerButton: DeleteServerButton
     }
 
     BrowseButton.OnEvent("Click", (*) => BrowseModelFile(ModelPathEdit))
-    ServerManagerButton.OnEvent(
-        "Click",
-        (*) => OpenServerManager(DialogGui, GetAddModelServerKey(), RefreshAddModelServers)
-    )
+    ServerControl.OnEvent("Change", UpdateAddModelServerButtons)
+    EditServerButton.OnEvent("Click", EditAddModelServer)
+    AddServerButton.OnEvent("Click", AddAddModelServer)
+    DeleteServerButton.OnEvent("Click", DeleteAddModelServer)
     SaveButton.OnEvent("Click", SaveAddModelDialog)
     CancelButton.OnEvent("Click", CloseAddModelDialog)
     DialogGui.OnEvent("Close", CloseAddModelDialog)
@@ -2317,6 +2502,61 @@ RefreshAddModelServers(PreferredServerKey := "") {
         SelectedIndex := 1
 
     State.ServerControl.Choose(SelectedIndex)
+    UpdateAddModelServerButtons()
+}
+
+
+UpdateAddModelServerButtons(*) {
+    global ModelRegistrationState
+    global Servers
+
+    if !IsObject(ModelRegistrationState)
+        return
+
+    ServerKey := GetAddModelServerKey()
+    Registered := ServerKey != "" && Servers.Has(ServerKey)
+
+    ModelRegistrationState.EditServerButton.Enabled := Registered
+    ModelRegistrationState.DeleteServerButton.Enabled := Registered
+}
+
+
+EditAddModelServer(*) {
+    global ModelRegistrationState
+    global Servers
+
+    ServerKey := GetAddModelServerKey()
+    if ServerKey = "" || !Servers.Has(ServerKey)
+        return
+
+    OpenServerEditor(
+        ModelRegistrationState.Gui,
+        ServerKey,
+        RefreshAddModelServers
+    )
+}
+
+
+AddAddModelServer(*) {
+    global ModelRegistrationState
+
+    OpenServerEditor(
+        ModelRegistrationState.Gui,
+        "",
+        RefreshAddModelServers
+    )
+}
+
+
+DeleteAddModelServer(*) {
+    ServerKey := GetAddModelServerKey()
+    if ServerKey = ""
+        return
+
+    if !ConfirmDeleteServer(ServerKey)
+        return
+
+    RefreshAddModelServers()
 }
 
 
@@ -6038,11 +6278,22 @@ EditSelectedServer(*) {
 
 
 DeleteSelectedServer(*) {
+    ServerKey := GetSelectedServerManagerKey()
+    if ServerKey = ""
+        return
+
+    if !ConfirmDeleteServer(ServerKey)
+        return
+
+    RefreshServerManager()
+}
+
+
+ConfirmDeleteServer(ServerKey) {
     global Servers
 
-    ServerKey := GetSelectedServerManagerKey()
     if ServerKey = "" || !Servers.Has(ServerKey)
-        return
+        return false
 
     Server := Servers[ServerKey]
     ModelNames := GetModelsUsingServer(ServerKey)
@@ -6057,15 +6308,15 @@ DeleteSelectedServer(*) {
     }
 
     if MsgBox(Message, "Delete Llama Server", "YesNo Icon?") != "Yes"
-        return
+        return false
 
     DeleteServer(ServerKey)
-    RefreshServerManager()
-    NotifyServerManagerChanged(GetSelectedServerManagerKey())
+    NotifyServerManagerChanged()
+    return true
 }
 
 
-OpenServerEditor(ParentGui, ServerKey := "") {
+OpenServerEditor(ParentGui, ServerKey := "", OnSaved := 0) {
     global ServerEditorState
     global Servers
     global BaseColor, SecondaryColor, TextColor, MutedColor
@@ -6135,7 +6386,7 @@ OpenServerEditor(ParentGui, ServerKey := "") {
     MakeOwnerDrawButton(CancelButton)
 
     ServerEditorState := {
-        Gui: EditorGui, Parent: ParentGui, ServerKey: ServerKey, NameEdit: NameEdit,
+        Gui: EditorGui, Parent: ParentGui, ServerKey: ServerKey, OnSaved: OnSaved, NameEdit: NameEdit,
         ExecutableEdit: ExecutableEdit, AddressEdit: AddressEdit, PortEdit: PortEdit, ArgsEdit: ArgsEdit
     }
 
@@ -6203,9 +6454,14 @@ SaveServerEditor(*) {
         ? SaveServer(State.ServerKey, Name, Executable, Address, Port, Args)
         : AddServer(Name, Executable, Address, Port, Args)
 
+    Callback := State.OnSaved
+
     CloseServerEditor()
     RefreshServerManager(SavedKey)
     NotifyServerManagerChanged(SavedKey)
+
+    if IsObject(Callback)
+        Callback.Call(SavedKey)
 }
 
 
@@ -6227,6 +6483,7 @@ CloseServerEditor(*) {
 
 NotifyServerManagerChanged(ServerKey := "") {
     global ServerManagerState
+    global MainGui, ActiveGui
 
     if IsObject(ServerManagerState) {
         Callback := ServerManagerState.OnChanged
@@ -6234,10 +6491,14 @@ NotifyServerManagerChanged(ServerKey := "") {
             Callback.Call(ServerKey)
     }
 
-    ; Registry edits should refresh persistent/configuration views immediately,
-    ; but must not rewrite the endpoint snapshot of a live llama session.
-    UpdateMainModelInfo()
-    RefreshActiveLlamaDetails()
+    ; Setup can use the same registry UI before Start/Active windows exist.
+    ; When those views do exist, refresh them without rewriting live runtime
+    ; endpoint snapshots.
+    if IsSet(MainGui) && IsObject(MainGui)
+        UpdateMainModelInfo()
+
+    if IsSet(ActiveGui) && IsObject(ActiveGui)
+        RefreshActiveLlamaDetails()
 }
 
 ; ============================================================
