@@ -70,10 +70,32 @@ LegacyLlamaPort := ConfigReadInteger(
     18080
 )
 
+McpEnabled := ConfigReadBoolean(
+    "MCP",
+    "Enabled",
+    true
+)
+
+McpMode := NormalizeMcpMode(
+    ConfigRead(
+        "MCP",
+        "Mode",
+        "Local"
+    )
+)
+
+McpAddress := ConfigRead(
+    "MCP",
+    "Address",
+    "127.0.0.1"
+)
+
 McpPort := ConfigReadInteger(
     "MCP",
     "Port",
-    18081
+    18081,
+    1,
+    65535
 )
 
 McpDirectories := ConfigRead(
@@ -117,6 +139,7 @@ ActiveServerKey := ""
 ActiveContext := 0
 ActiveCache := ""
 ActiveMcpDirectories := ""
+ActiveMcpConfig := 0
 
 ActiveConfigDialog := 0
 
@@ -650,15 +673,40 @@ DeleteModel(ModelKey) {
     return true
 }
 
-SaveMcpDefaults(Directories) {
+SaveMcpDefaults(Enabled, Mode, Address, Port, Directories) {
+    global McpEnabled, McpMode, McpAddress, McpPort
     global McpDirectories
 
-    ConfigWrite(
+    Mode := NormalizeMcpMode(Mode)
+    Address := Trim(Address)
+
+    ; Remote MCP has no local filesystem-access contract. Keep the
+    ; last persisted Local roots instead of accepting directory edits
+    ; made before the user switched modes.
+    if Mode = "Remote"
+        Directories := McpDirectories
+
+    ConfigWriteMany(
         "MCP",
-        "GlobalDirectories",
-        Directories
+        Map(
+            "Enabled", Enabled ? "true" : "false",
+            "Mode", Mode,
+            "Address", Address,
+            "Port", Port,
+            "GlobalDirectories", Directories
+        )
     )
 
+    ; Retire the old pre-Phase-6 key once this section is saved.
+    try ConfigDeleteKey(
+        "MCP",
+        "Directories"
+    )
+
+    McpEnabled := Enabled
+    McpMode := Mode
+    McpAddress := Address
+    McpPort := Port
     McpDirectories := Directories
 }
 
@@ -1282,7 +1330,7 @@ class ModelConfigPanel {
 }
 
 class McpConfigPanel {
-    __New(GuiObj, X, Y, Width, Directories) {
+    __New(GuiObj, X, Y, Width, Enabled, Mode, Address, Port, Directories) {
         global SecondaryColor, TextColor, MutedColor
 
         this.Gui := GuiObj
@@ -1290,35 +1338,61 @@ class McpConfigPanel {
         this.Y := Y
         this.Width := Width
 
-        GuiObj.SetFont(
-            "s12 Norm c" TextColor,
-            "Segoe UI"
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
+        GuiObj.AddText("x" X " y" Y, "Use MCP")
+        Y += 29
+
+        this.EnabledControl := GuiObj.AddDropDownList(
+            "x" X " y" Y " w" Width " +0x210",
+            ["Enabled", "Disabled"]
+        )
+        ApplyDarkControl(this.EnabledControl)
+
+        Y += 50
+        GuiObj.AddText("x" X " y" Y, "Mode")
+        Y += 29
+
+        this.ModeControl := GuiObj.AddDropDownList(
+            "x" X " y" Y " w" Width " +0x210",
+            ["Local", "Remote"]
+        )
+        ApplyDarkControl(this.ModeControl)
+
+        Y += 50
+        AddressWidth := Width - 124
+
+        GuiObj.AddText("x" X " y" Y, "Address")
+        GuiObj.AddText("x" (X + AddressWidth + 20) " yp", "Port")
+        Y += 29
+
+        this.AddressEdit := GuiObj.AddEdit(
+            "x" X " y" Y
+            . " w" AddressWidth
+            . " Background" SecondaryColor
+            . " c" TextColor,
+            Address
         )
 
-        GuiObj.AddText(
-            "x" X " y" Y,
-            "MCP directories"
+        this.PortEdit := GuiObj.AddEdit(
+            "x" (X + AddressWidth + 20) " yp"
+            . " w104"
+            . " Background" SecondaryColor
+            . " c" TextColor,
+            Port
         )
 
-        Y += 27
+        Y += 50
+        GuiObj.AddText("x" X " y" Y, "Global MCP directories")
+        Y += 25
 
-        GuiObj.SetFont(
-            "s10 c" MutedColor,
-            "Segoe UI"
-        )
-
-        GuiObj.AddText(
+        GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
+        this.DirectoryHelp := GuiObj.AddText(
             "x" X " y" Y " w" Width,
-            "One explicitly allowed directory per line"
+            "Available to every model when MCP mode is Local."
         )
+        Y += 25
 
-        Y += 27
-
-        GuiObj.SetFont(
-            "s11 c" TextColor,
-            "Segoe UI"
-        )
-
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
         this.DirectoryEdit := GuiObj.AddEdit(
             "x" X " y" Y
             . " w" Width
@@ -1326,12 +1400,85 @@ class McpConfigPanel {
             . SecondaryColor
             . " c"
             . TextColor,
-            DirectoriesForEdit(
-                Directories
-            )
+            DirectoriesForEdit(Directories)
         )
 
         this.Bottom := Y + 94
+
+        this.EnabledControl.OnEvent(
+            "Change",
+            ObjBindMethod(this, "UpdateModeState")
+        )
+
+        this.ModeControl.OnEvent(
+            "Change",
+            ObjBindMethod(this, "UpdateModeState")
+        )
+
+        this.SetValues(
+            Enabled,
+            Mode,
+            Address,
+            Port,
+            Directories
+        )
+    }
+
+
+    SetValues(Enabled, Mode, Address, Port, Directories) {
+        this.EnabledControl.Choose(Enabled ? 1 : 2)
+        this.ModeControl.Choose(NormalizeMcpMode(Mode) = "Remote" ? 2 : 1)
+        this.AddressEdit.Text := Address
+        this.PortEdit.Text := Port
+        this.SetDirectories(Directories)
+        this.UpdateModeState()
+    }
+
+
+    UpdateModeState(*) {
+        Remote := this.ModeControl.Value = 2
+
+        this.DirectoryEdit.Enabled := !Remote
+        this.DirectoryHelp.Text := Remote
+            ? "Ignored while MCP is Remote; retained for Local mode."
+            : "Available to every model when MCP mode is Local."
+    }
+
+
+    GetValues() {
+        Enabled := this.EnabledControl.Value = 1
+        Mode := this.ModeControl.Value = 2 ? "Remote" : "Local"
+        Address := Trim(this.AddressEdit.Text)
+        Port := Trim(this.PortEdit.Text)
+        Directories := this.GetDirectories()
+
+        if Enabled && Address = "" {
+            MsgBox(
+                "MCP address cannot be blank while MCP is enabled.",
+                "MCP Access",
+                "Icon!"
+            )
+
+            return false
+        }
+
+        if !IsInteger(Port) || Port < 1 || Port > 65535 {
+            MsgBox(
+                "MCP port must be an integer from 1 through 65535.",
+                "MCP Access",
+                "Icon!"
+            )
+
+            return false
+        }
+
+        return {
+            Enabled: Enabled,
+            Mode: Mode,
+            Address: Address,
+            Port: Port + 0,
+            Directories: Directories
+        }
     }
 
 
@@ -1358,6 +1505,7 @@ OpenConfig(*) {
     global MainGui
     global MainModelControl
     global ModelList
+    global McpEnabled, McpMode, McpAddress, McpPort
     global McpDirectories
     global BaseColor, TextColor
 
@@ -1415,6 +1563,10 @@ OpenConfig(*) {
         26,
         ModelPanel.Bottom + 20,
         520,
+        McpEnabled,
+        McpMode,
+        McpAddress,
+        McpPort,
         McpDirectories
     )
 
@@ -1485,21 +1637,12 @@ StartMasterConfig(
     if !Values
         return
 
-    Directories :=
-        McpPanel.GetDirectories()
+    McpValues := McpPanel.GetValues()
 
-    if Directories = "" {
-        MsgBox(
-            "At least one MCP directory must be specified.",
-            "Local AI",
-            "Icon!"
-        )
-
+    if !McpValues
         return
-    }
 
-    if !VerifyDirectories(Directories)
-        return
+    Directories := McpValues.Directories
 
     EndConfigDialog(
         ConfigGui,
@@ -2278,7 +2421,18 @@ RefreshMainModelControl(PreferredModelKey := "") {
 ; ============================================================
 
 OpenMcpEditor(*) {
-    global ActiveMcpDirectories
+    global ActiveGui
+
+    OpenMcpConfigEditor(
+        ActiveGui,
+        true
+    )
+}
+
+
+OpenMcpConfigEditor(ParentGui, AllowApply := false) {
+    global McpEnabled, McpMode, McpAddress, McpPort
+    global McpDirectories
     global BaseColor, TextColor
 
     EditorGui := Gui(
@@ -2286,18 +2440,17 @@ OpenMcpEditor(*) {
         "MCP Access"
     )
 
-	if !BeginConfigDialog(
-		EditorGui,
-		ActiveGui
-	)
-		return
+    if !BeginConfigDialog(
+        EditorGui,
+        ParentGui
+    )
+        return
 
     EditorGui.BackColor := BaseColor
     EditorGui.MarginX := 24
     EditorGui.MarginY := 20
 
     ApplyDarkWindow(EditorGui)
-
 
     EditorGui.SetFont(
         "s14 Bold c" TextColor,
@@ -2309,164 +2462,206 @@ OpenMcpEditor(*) {
         "MCP ACCESS"
     )
 
-
     McpPanel := McpConfigPanel(
         EditorGui,
         24,
         70,
         480,
-        ActiveMcpDirectories
+        McpEnabled,
+        McpMode,
+        McpAddress,
+        McpPort,
+        McpDirectories
     )
-
 
     EditorGui.SetFont(
         "s12 c" TextColor,
         "Segoe UI"
     )
 
-	ApplyButton := EditorGui.AddButton(
-		"x24 y" McpPanel.Bottom + 22
-		. " w150 h42",
-		"Apply"
-	)
+    if AllowApply {
+        SaveButton := EditorGui.AddButton(
+            "x24 y" McpPanel.Bottom + 22
+            . " w150 h42",
+            "Save"
+        )
 
-	SaveDefaultsButton := EditorGui.AddButton(
-		"x189 yp w150 h42",
-		"Save Defaults"
-	)
+        SaveApplyButton := EditorGui.AddButton(
+            "x189 yp w150 h42",
+            "Save && Apply"
+        )
 
-	CancelButton := EditorGui.AddButton(
-		"x354 yp w150 h42",
-		"Cancel"
-	)
+        CancelButton := EditorGui.AddButton(
+            "x354 yp w150 h42",
+            "Cancel"
+        )
 
-	MakeOwnerDrawButton(ApplyButton)
-	MakeOwnerDrawButton(SaveDefaultsButton)
-	MakeOwnerDrawButton(CancelButton)
+        MakeOwnerDrawButton(SaveButton)
+        MakeOwnerDrawButton(SaveApplyButton)
+        MakeOwnerDrawButton(CancelButton)
 
+        SaveButton.OnEvent(
+            "Click",
+            (*) => SaveMcpEditorOnly(
+                EditorGui,
+                ParentGui,
+                McpPanel
+            )
+        )
 
-	EditorGui.OnEvent(
-		"Close",
-		(*) => EndConfigDialog(
-			EditorGui,
-			ActiveGui
-		)
-	)
+        SaveApplyButton.OnEvent(
+            "Click",
+            (*) => SaveAndApplyMcpEditor(
+                EditorGui,
+                ParentGui,
+                McpPanel
+            )
+        )
+    }
+    else {
+        SaveButton := EditorGui.AddButton(
+            "x24 y" McpPanel.Bottom + 22
+            . " w230 h42",
+            "Save"
+        )
 
-	SaveDefaultsButton.OnEvent(
-		"Click",
-		(*) => SaveMcpEditorDefaults(
-			McpPanel
-		)
-	)
+        CancelButton := EditorGui.AddButton(
+            "x274 yp w230 h42",
+            "Cancel"
+        )
 
-    ApplyButton.OnEvent(
-        "Click",
-        (*) => ApplyMcpAccess(
+        MakeOwnerDrawButton(SaveButton)
+        MakeOwnerDrawButton(CancelButton)
+
+        SaveButton.OnEvent(
+            "Click",
+            (*) => SaveMcpEditorOnly(
+                EditorGui,
+                ParentGui,
+                McpPanel
+            )
+        )
+    }
+
+    EditorGui.OnEvent(
+        "Close",
+        (*) => EndConfigDialog(
             EditorGui,
-            McpPanel
+            ParentGui
         )
     )
 
     CancelButton.OnEvent(
         "Click",
-        (*) => EndConfigDialog(EditorGui, ActiveGui)
+        (*) => EndConfigDialog(
+            EditorGui,
+            ParentGui
+        )
     )
 
     ShowRelative(
-		EditorGui,
-		ActiveGui
-	)
+        EditorGui,
+        ParentGui
+    )
 }
 
-SaveMcpEditorDefaults(McpPanel) {
+
+SaveMcpEditorConfig(McpPanel) {
     global MainMcpText
     global McpDirectories
 
-    Directories :=
-        GetValidMcpDirectories(
-            McpPanel
-        )
+    Values := McpPanel.GetValues()
 
-    if !Directories
-        return
+    if !Values
+        return false
+
+    Directories := Values.Directories
+
+    if Values.Mode = "Local"
+    && Directories != ""
+    && !VerifyDirectories(Directories)
+        return false
 
     SaveMcpDefaults(
+        Values.Enabled,
+        Values.Mode,
+        Values.Address,
+        Values.Port,
         Directories
     )
+
+    if Values.Mode = "Remote"
+        McpPanel.SetDirectories(McpDirectories)
+
+    Values.Directories := McpDirectories
 
     MainMcpText.Text :=
         DisplayDirectories(
             McpDirectories
         )
+
+    return Values
 }
 
-ApplyMcpAccess(EditorGui, McpPanel) {
-    global ActiveMcpDirectories
-    global McpPid, McpPort
 
-	Directories :=
-		GetValidMcpDirectories(
-			McpPanel
-		)
+SaveMcpEditorOnly(EditorGui, ParentGui, McpPanel) {
+    global ControllerMode
 
-	if !Directories
-		return
-
-    if !VerifyDirectories(Directories)
+    if !SaveMcpEditorConfig(McpPanel)
         return
 
-	if SameDirectories(
-		Directories,
-		ActiveMcpDirectories
-	) {
-		EndConfigDialog(
-			EditorGui,
-			ActiveGui
-		)
-		return
-	}
-
-    Status := HttpStatus(
-        "http://127.0.0.1:"
-        . McpPort
-        . "/status"
+    EndConfigDialog(
+        EditorGui,
+        ParentGui
     )
 
-    Owned :=
-        McpPid
-        && ProcessExist(McpPid)
+    if ControllerMode = "active"
+        UpdateActiveState()
+}
 
 
-    ; Do not commandeer somebody else's MCP process.
+SaveAndApplyMcpEditor(EditorGui, ParentGui, McpPanel) {
+    Values := SaveMcpEditorConfig(McpPanel)
 
-    if Status != 0 && !Owned {
+    if !Values
+        return
+
+    EndConfigDialog(
+        EditorGui,
+        ParentGui
+    )
+
+    if !RequireCurrentMcpRuntime(
+        Values.Enabled,
+        Values.Mode
+    ) {
+        UpdateActiveState()
+        return
+    }
+
+    ApplySavedMcpConfiguration()
+}
+
+
+ApplySavedMcpConfiguration() {
+    global McpPid, McpState
+
+    if McpState = "external" {
         MsgBox(
             "The active MCP service was not started by this controller.`n`n"
-            . "Its access configuration cannot be changed safely.",
+            . "The new configuration was saved, but cannot be applied safely until that service is stopped.",
             "MCP Access",
             "Icon!"
         )
 
+        UpdateActiveState()
         return
     }
 
-
-    ActiveMcpDirectories := Directories
-
-    EndConfigDialog(
-		EditorGui,
-		ActiveGui
-	)
-
-
-    ; If MCP is running, applying new access means restart.
-    ; If it is offline, simply stage the new directories.
-
-    if Status != 0
+    if McpPid && ProcessExist(McpPid)
         RestartActiveMcp()
     else
-        UpdateActiveState()
+        StartActiveMcp()
 }
 
 ; ============================================================
@@ -3356,11 +3551,14 @@ StopProcessTree(Pid) {
 
 LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverride := "") {
 	global Models
+    global McpEnabled, McpMode, McpDirectories
 	global McpPort
+    global McpStartupUntil
+    global ActiveMcpConfig, ActiveMcpDirectories
     global ActiveHasLaunched
 
     Model := Models[ModelKey]
-	
+
     ServerKey := ServerKeyOverride != "" ? ServerKeyOverride : Model.ServerKey
     Server := GetServer(ServerKey)
 
@@ -3415,34 +3613,88 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
         return
     }
 
-    if !VerifyDirectories(Directories) {
-        ReturnToStartup()
-        return
-    }
-
-
     ; --------------------------------------------------------
     ;  MCP
     ; --------------------------------------------------------
 
-    McpURL :=
-        "http://127.0.0.1:"
-        . McpPort
-        . "/status"
-
-    if HttpStatus(McpURL) = 0 {
-        StartMcp(Directories)
-
-        if !WaitForHttp(
-            McpURL,
-            10000
-        ) {
+    ; MCP is optional. A configuration or startup failure is reported,
+    ; but never prevents the selected model from loading.
+    if McpEnabled {
+        if NormalizeMcpMode(McpMode) != "Local" {
             MsgBox(
-                "MCP was started, but did not become available.",
-                "Local AI",
+                "Remote MCP is configured, but remote runtime handling is not active in this build.`n`nThe model will start without MCP.",
+                "MCP Access",
                 "Icon!"
             )
         }
+        else {
+            ; MCP has one persistent configuration. Session launch uses
+            ; the saved global roots, not transient text from another UI.
+            Directories := McpDirectories
+
+            LaunchDirectories := FilterMcpDirectoriesForLaunch(
+                Directories
+            )
+
+            if LaunchDirectories = "" {
+                if Trim(Directories) = "" {
+                    MsgBox(
+                        "No MCP directories are configured.`n`nThe model will start without MCP.",
+                        "MCP Access",
+                        "Icon!"
+                    )
+                }
+
+                McpStartupUntil := 0
+                ActiveMcpConfig := 0
+                ActiveMcpDirectories := ""
+                UpdateMcpState()
+            }
+            else {
+                McpURL :=
+                    "http://127.0.0.1:"
+                    . McpPort
+                    . "/status"
+
+                if HttpStatus(McpURL) = 0 {
+                    try {
+                        StartMcp(LaunchDirectories)
+
+                        if !WaitForHttp(
+                            McpURL,
+                            10000
+                        ) {
+                            MsgBox(
+                                "MCP was started, but did not become available.`n`nThe model will continue without MCP.",
+                                "MCP Access",
+                                "Icon!"
+                            )
+                        }
+                    }
+                    catch Error as Err {
+                        McpStartupUntil := 0
+                        ActiveMcpConfig := 0
+                        ActiveMcpDirectories := ""
+
+                        MsgBox(
+                            "MCP could not be started:`n`n"
+                            . Err.Message
+                            . "`n`nThe model will continue without MCP.",
+                            "MCP Access",
+                            "Icon!"
+                        )
+
+                        UpdateMcpState()
+                    }
+                }
+            }
+        }
+    }
+    else {
+        McpStartupUntil := 0
+        ActiveMcpConfig := 0
+        ActiveMcpDirectories := ""
+        UpdateMcpState()
     }
 
 
@@ -3508,9 +3760,11 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverrid
 ; ============================================================
 
 StartMcp(Directories) {
-	global McpPort
+    global McpPort
     global McpPid
     global McpLog
+    global ActiveMcpConfig
+    global ActiveMcpDirectories
 
     DirectoryArgs := ""
 
@@ -3521,32 +3775,40 @@ StartMcp(Directories) {
             DirectoryArgs .= ' "' Directory '"'
     }
 
+    McpCommand :=
+        "mcp-proxy "
+        . "--host 127.0.0.1 "
+        . "--port " McpPort " "
+        . "--transport streamablehttp "
+        . "-- "
+        . "mcp-server-filesystem"
+        . DirectoryArgs
 
-	McpCommand :=
-		"mcp-proxy "
-		. "--host 127.0.0.1 "
-		. "--port " McpPort " "
-		. "--transport streamablehttp "
-		. "-- "
-		. "mcp-server-filesystem"
-		. DirectoryArgs
+    Command :=
+        A_ComSpec
+        . ' /d /s /c "'
+        . McpCommand
+        . ' >> "'
+        . McpLog
+        . '" 2>&1"'
 
-	Command :=
-		A_ComSpec
-		. ' /d /s /c "'
-		. McpCommand
-		. ' >> "'
-		. McpLog
-		. '" 2>&1"'
+    Run(
+        Command,
+        A_ScriptDir,
+        "Hide",
+        &McpPid
+    )
 
-	Run(
-		Command,
-		A_ScriptDir,
-		"Hide",
-		&McpPid
-	)
-
+    ActiveMcpDirectories := Directories
+    ActiveMcpConfig := {
+        Enabled: true,
+        Mode: "Local",
+        Address: "127.0.0.1",
+        Port: McpPort + 0,
+        Directories: Directories
+    }
 }
+
 
 ; ============================================================
 ;  START LLAMA
@@ -4029,7 +4291,9 @@ UpdateLlamaState() {
 
 
 UpdateMcpState() {
-    global McpPid, McpPort
+    global McpPid
+    global McpDirectories
+    global ActiveMcpConfig
     global ActiveMcpDirectories
 
     global ActiveMcpStatus
@@ -4040,26 +4304,29 @@ UpdateMcpState() {
     global ActiveMcpStartButton
     global ActiveMcpRestartButton
     global ActiveMcpStopButton
-	
-	global McpStartupUntil
-	global McpState
 
+    global McpStartupUntil
+    global McpState
 
-    if McpPid && !ProcessExist(McpPid)
+    if McpPid && !ProcessExist(McpPid) {
         McpPid := 0
+        ActiveMcpConfig := 0
+    }
 
     Owned :=
         McpPid
         && ProcessExist(McpPid)
 
+    RuntimePort := GetActiveMcpPort()
+
     Status := HttpStatus(
         "http://127.0.0.1:"
-        . McpPort
+        . RuntimePort
         . "/status"
     )
-	
-	if Status != 0
-		McpStartupUntil := 0
+
+    if Status != 0
+        McpStartupUntil := 0
 
 
     ; --------------------------------------------------------
@@ -4067,27 +4334,30 @@ UpdateMcpState() {
     ; --------------------------------------------------------
 
     if Status = 0 {
-		if A_TickCount < McpStartupUntil {
-			McpState := "loading"
-			ActiveMcpStatus.Text := "◐ Loading"
+        if A_TickCount < McpStartupUntil {
+            McpState := "loading"
+            ActiveMcpStatus.Text := "◐ Loading"
 
-			ActiveMcpEditButton.Enabled := false
-			ActiveMcpStartButton.Enabled := false
-			ActiveMcpRestartButton.Enabled := false
-			ActiveMcpStopButton.Enabled := true
+            ActiveMcpEditButton.Enabled := false
+            ActiveMcpStartButton.Enabled := false
+            ActiveMcpRestartButton.Enabled := false
+            ActiveMcpStopButton.Enabled := true
 
-			return false
-		}
+            return false
+        }
 
-		McpStartupUntil := 0
+        McpStartupUntil := 0
+
+        if !Owned
+            ActiveMcpConfig := 0
 
         McpState := "offline"
-		ActiveMcpStatus.Text := "○ Offline"
+        ActiveMcpStatus.Text := "○ Offline"
         ActiveMcpName.Text := "Filesystem"
 
         ActiveMcpDetails.Text :=
             DisplayDirectories(
-                ActiveMcpDirectories
+                McpDirectories
             )
 
         ActiveMcpEditButton.Enabled := true
@@ -4104,13 +4374,14 @@ UpdateMcpState() {
     ; --------------------------------------------------------
 
     if !Owned {
+        ActiveMcpConfig := 0
         McpState := "external"
-		ActiveMcpStatus.Text := "● External"
+        ActiveMcpStatus.Text := "● External"
         ActiveMcpName.Text := "Existing MCP service"
 
         ActiveMcpDetails.Text :=
             "Port "
-            . McpPort
+            . RuntimePort
             . "  •  Access configuration unknown"
 
         ActiveMcpEditButton.Enabled := false
@@ -4127,21 +4398,31 @@ UpdateMcpState() {
     ; --------------------------------------------------------
 
     McpState := "online"
-	ActiveMcpStatus.Text := "● Online"
+    ActiveMcpStatus.Text := "● Online"
     ActiveMcpName.Text := "Filesystem"
 
-    ActiveMcpDetails.Text :=
+    Details :=
         DisplayDirectories(
             ActiveMcpDirectories
         )
+
+    if McpHasPendingChanges() {
+        if Details != ""
+            Details := "Changes pending`n" Details
+        else
+            Details := "Changes pending"
+    }
+
+    ActiveMcpDetails.Text := Details
 
     ActiveMcpEditButton.Enabled := true
     ActiveMcpStartButton.Enabled := false
     ActiveMcpRestartButton.Enabled := true
     ActiveMcpStopButton.Enabled := true
-	
-	return true
+
+    return true
 }
+
 
 EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     global ControllerMode
@@ -4152,6 +4433,8 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     global ActiveContext
     global ActiveCache
     global ActiveMcpDirectories
+    global ActiveMcpConfig
+    global McpDirectories
 
     global MainGui, ActiveGui
     global MainModelControl
@@ -4182,7 +4465,9 @@ EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     ActiveServerKey := ServerKey != "" ? ServerKey : Models[ModelKey].ServerKey
     ActiveContext := Context
     ActiveCache := Cache
-    ActiveMcpDirectories := Directories
+
+    if !IsObject(ActiveMcpConfig)
+        ActiveMcpDirectories := McpDirectories
 	
 	ActiveLlamaEditButton.Enabled := false
 
@@ -4474,39 +4759,68 @@ StopActiveLlama(*) {
 ; ============================================================
 
 StartActiveMcp(*) {
+    global McpEnabled, McpMode, McpDirectories
     global ActiveMcpDirectories
+    global ActiveMcpConfig
     global ActiveMcpStatus
     global McpStartupUntil, McpStartupGrace
     global FastPollRate
 
-	SetActivePollRate(FastPollRate)
-    
-	McpStartupUntil :=
+    SetActivePollRate(FastPollRate)
+
+    if !RequireCurrentMcpRuntime(
+        McpEnabled,
+        McpMode
+    ) {
+        McpStartupUntil := 0
+        UpdateActiveState()
+        return
+    }
+
+    Directories := FilterMcpDirectoriesForLaunch(
+        McpDirectories
+    )
+
+    if Directories = "" {
+        if Trim(McpDirectories) = "" {
+            MsgBox(
+                "No MCP directories are configured.`n`nMCP will stay Offline.",
+                "MCP Access",
+                "Icon!"
+            )
+        }
+
+        McpStartupUntil := 0
+        ActiveMcpConfig := 0
+        ActiveMcpDirectories := ""
+        UpdateActiveState()
+        return
+    }
+
+    McpStartupUntil :=
         A_TickCount
         + McpStartupGrace
-
-    if !VerifyDirectories(
-        ActiveMcpDirectories
-    )
-        return
 
     ActiveMcpStatus.Text := "◐ Starting"
 
     StartMcp(
-        ActiveMcpDirectories
+        Directories
     )
 }
 
 
 RestartActiveMcp(*) {
-    global McpPid, McpPort
+    global McpPid
+    global ActiveMcpConfig
     global ActiveMcpStatus
-	global FastPollRate
+    global FastPollRate
 
-	SetActivePollRate(FastPollRate)
+    SetActivePollRate(FastPollRate)
 
     if !McpPid
         return
+
+    OldPort := GetActiveMcpPort()
 
     ActiveMcpStatus.Text := "◐ Restarting"
 
@@ -4515,28 +4829,35 @@ RestartActiveMcp(*) {
 
     WaitForOffline(
         "http://127.0.0.1:"
-        . McpPort
+        . OldPort
         . "/status",
         10000
     )
 
+    ActiveMcpConfig := 0
     StartActiveMcp()
 }
 
 
 StopActiveMcp(*) {
-    global McpPid, McpPort
+    global McpPid
+    global ActiveMcpConfig
     global ActiveMcpStatus, FastPollRate
 
     SetActivePollRate(FastPollRate)
 
+    RuntimePort := GetActiveMcpPort()
+
     StatusURL :=
         "http://127.0.0.1:"
-        . McpPort
+        . RuntimePort
         . "/status"
 
-    if HttpStatus(StatusURL) = 0
+    if HttpStatus(StatusURL) = 0 {
+        ActiveMcpConfig := 0
+        UpdateActiveState()
         return
+    }
 
 
     ; --------------------------------------------------------
@@ -4559,7 +4880,7 @@ StopActiveMcp(*) {
         Result := MsgBox(
             "This MCP server was not started by the controller.`n`n"
             . "Terminate the process listening on port "
-            . McpPort
+            . RuntimePort
             . "?",
             "Terminate External MCP",
             "YesNo Icon?"
@@ -4569,13 +4890,13 @@ StopActiveMcp(*) {
             return
 
         ExternalPid := GetListeningPid(
-            McpPort
+            RuntimePort
         )
 
         if !ExternalPid {
             MsgBox(
                 "The process using port "
-                . McpPort
+                . RuntimePort
                 . " could not be identified.",
                 "Local AI",
                 "Icon!"
@@ -4591,12 +4912,12 @@ StopActiveMcp(*) {
         )
     }
 
-
     WaitForOffline(
         StatusURL,
         10000
     )
 
+    ActiveMcpConfig := 0
     UpdateActiveState()
 }
 
@@ -4715,6 +5036,140 @@ ReturnToStartup() {
 }
 
 ; ============================================================
+;  MCP CONFIGURATION HELPERS
+; ============================================================
+
+NormalizeMcpMode(Mode) {
+    return StrLower(Trim(Mode)) = "remote"
+        ? "Remote"
+        : "Local"
+}
+
+
+RequireCurrentMcpRuntime(Enabled, Mode) {
+    if Enabled && NormalizeMcpMode(Mode) = "Local"
+        return true
+
+    MsgBox(
+        "Disabled and Remote MCP modes are now configurable, but their runtime behavior is handled in the next MCP runtime phase.`n`nUse Save to persist this configuration for now.",
+        "MCP Access",
+        "Icon!"
+    )
+
+    return false
+}
+
+
+GetSavedMcpConfig() {
+    global McpEnabled, McpMode, McpAddress, McpPort
+    global McpDirectories
+
+    return {
+        Enabled: McpEnabled,
+        Mode: NormalizeMcpMode(McpMode),
+        Address: Trim(McpAddress),
+        Port: McpPort + 0,
+        Directories: McpDirectories
+    }
+}
+
+
+McpConfigsMatch(A, B) {
+    if !IsObject(A) || !IsObject(B)
+        return false
+
+    if A.Enabled != B.Enabled
+        return false
+
+    if NormalizeMcpMode(A.Mode) != NormalizeMcpMode(B.Mode)
+        return false
+
+    if StrLower(Trim(A.Address)) != StrLower(Trim(B.Address))
+        return false
+
+    if A.Port + 0 != B.Port + 0
+        return false
+
+    if NormalizeMcpMode(A.Mode) = "Local"
+        return SameDirectories(A.Directories, B.Directories)
+
+    return true
+}
+
+
+McpHasPendingChanges() {
+    global ActiveMcpConfig
+
+    if !IsObject(ActiveMcpConfig)
+        return false
+
+    return !McpConfigsMatch(
+        ActiveMcpConfig,
+        GetSavedMcpConfig()
+    )
+}
+
+
+GetActiveMcpPort() {
+    global ActiveMcpConfig
+    global McpPort
+
+    if IsObject(ActiveMcpConfig)
+        return ActiveMcpConfig.Port
+
+    return McpPort
+}
+
+
+FilterMcpDirectoriesForLaunch(Directories, Notify := true) {
+    Valid := ""
+    Missing := []
+
+    for Directory in StrSplit(Directories, "|") {
+        Directory := Trim(Directory)
+
+        if Directory = ""
+            continue
+
+        if DirExist(Directory) {
+            if Valid != ""
+                Valid .= "|"
+
+            Valid .= Directory
+        }
+        else
+            Missing.Push(Directory)
+    }
+
+    if Notify && Missing.Length {
+        MissingText := ""
+
+        for Directory in Missing {
+            if MissingText != ""
+                MissingText .= "`n"
+
+            MissingText .= "  • " Directory
+        }
+
+        Message :=
+            "The following MCP directories were not found and will be omitted from this start:`n`n"
+            . MissingText
+
+        if Valid = ""
+            Message .= "`n`nNo valid directories remain. MCP will stay Offline."
+
+        MsgBox(
+            Message,
+            "MCP Access",
+            "Icon!"
+        )
+    }
+
+    return Valid
+}
+
+
+; ============================================================
 ;  DIRECTORY HELPERS
 ; ============================================================
 
@@ -4831,26 +5286,6 @@ GetParentDirectory(FilePath) {
     )
 
     return Directory
-}
-
-GetValidMcpDirectories(McpPanel) {
-    Directories :=
-        McpPanel.GetDirectories()
-
-    if Directories = "" {
-        MsgBox(
-            "At least one MCP directory must be specified.",
-            "MCP Access",
-            "Icon!"
-        )
-
-        return false
-    }
-
-    if !VerifyDirectories(Directories)
-        return false
-
-    return Directories
 }
 
 ; ============================================================
