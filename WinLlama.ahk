@@ -113,6 +113,7 @@ ControllerMode := "start"
 ActiveHasLaunched := false
 
 ActiveModelKey := ""
+ActiveServerKey := ""
 ActiveContext := 0
 ActiveCache := ""
 ActiveMcpDirectories := ""
@@ -121,6 +122,7 @@ ActiveConfigDialog := 0
 
 ServerManagerState := 0
 ServerEditorState := 0
+ModelRegistrationState := 0
 
 ActivePollRate := 0
 FastPollRate := 1000
@@ -569,25 +571,84 @@ ConfigReadBoolean(
         || Value = "on"
 }
 
-SaveModelDefaults(
-    ModelKey,
-    Context,
-    Cache
-) {
+SaveModelDefaults(ModelKey, ServerKey, Context, Cache, McpDirectories) {
     global Models
+
+    Model := Models[ModelKey]
+
+    SaveModel(
+        ModelKey, Model.Name, Model.Model, ServerKey,
+        Context, Cache, Model.Args, McpDirectories
+    )
+}
+
+
+SaveModel(ModelKey, Name, ModelPath, ServerKey, Context := 32768, Cache := "q4_0", Args := "", McpDirectories := "") {
+    global Models, ModelList
+
+    Model := {
+        Name: Name,
+        ServerKey: ServerKey,
+        Model: ModelPath,
+        Context: Context + 0,
+        Cache: Cache,
+        Args: Args,
+        McpDirectories: McpDirectories
+    }
 
     ConfigWriteMany(
         ModelKey,
         Map(
-            "Context", Context,
-            "Cache", Cache
+            "Name", Model.Name,
+            "Server", Model.ServerKey,
+            "Model", Model.Model,
+            "Context", Model.Context,
+            "Cache", Model.Cache,
+            "Args", Model.Args,
+            "McpDirectories", Model.McpDirectories
         )
     )
 
-    Models[ModelKey].Context := Context
-    Models[ModelKey].Cache := Cache
+    if !ListContainsValue(ModelList, ModelKey) {
+        ModelList.Push(ModelKey)
+        ConfigWriteList("General", "ModelList", ModelList)
+    }
+
+    Models[ModelKey] := Model
+    return ModelKey
 }
 
+
+AddModel(Name, ModelPath, ServerKey) {
+    ModelKey := GenerateConfigKey(Name, "Model")
+    return SaveModel(ModelKey, Name, ModelPath, ServerKey)
+}
+
+
+DeleteModel(ModelKey) {
+    global Models, ModelList, LastModel
+
+    if !ListContainsValue(ModelList, ModelKey)
+        return false
+
+    ConfigDeleteSection(ModelKey)
+    RemoveListValue(ModelList, ModelKey)
+    ConfigWriteList("General", "ModelList", ModelList)
+
+    if Models.Has(ModelKey)
+        Models.Delete(ModelKey)
+
+    if LastModel = ModelKey {
+        LastModel := ModelList.Length ? ModelList[1] : ""
+
+        if LastModel != ""
+            SaveLastModel(LastModel)
+        else
+            ConfigDeleteKey("State", "LastModel")
+    }
+
+    return true
+}
 
 SaveMcpDefaults(Directories) {
     global McpDirectories
@@ -890,115 +951,171 @@ StartSelected(*) {
 ; ============================================================
 
 class ModelConfigPanel {
-    __New(GuiObj, X, Y, Width, ModelKey, Context := "", Cache := "") {
-        global Models, ModelList
+    __New(GuiObj, X, Y, Width, ModelKey, Context := "", Cache := "", ServerKey := "") {
         global SecondaryColor, TextColor, MutedColor
 
         this.Gui := GuiObj
-        this.X := X
-        this.Y := Y
         this.Width := Width
+        this.ServerKeys := []
 
-        GuiObj.SetFont(
-            "s12 Norm c" TextColor,
-            "Segoe UI"
-        )
-
-        GuiObj.AddText(
-            "x" X " y" Y,
-            "Model"
-        )
-
-        ModelNames := []
-
-        for Key in ModelList
-            ModelNames.Push(Models[Key].Name)
-
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
+        GuiObj.AddText("x" X " y" Y, "Model")
         Y += 29
 
-        this.ModelControl := GuiObj.AddDropDownList(
-            "x" X " y" Y " w" Width " +0x210",
-            ModelNames
-        )
-
+        this.ModelControl := GuiObj.AddDropDownList("x" X " y" Y " w" (Width - 68) " +0x210", [])
         ApplyDarkControl(this.ModelControl)
 
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
+        this.AddModelButton := GuiObj.AddButton("x+8 yp w26 h26", "+")
+        GuiObj.SetFont("s13 c" TextColor, "Segoe UI")
+        this.DeleteModelButton := GuiObj.AddButton("x+8 yp w26 h26", "×")
+        MakeOwnerDrawButton(this.AddModelButton)
+        MakeOwnerDrawButton(this.DeleteModelButton)
+
         Y += 50
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
+        GuiObj.AddText("x" X " y" Y, "Llama server")
+        Y += 29
 
-        GuiObj.AddText(
-            "x" X " y" Y,
-            "Context"
-        )
+        this.ServerControl := GuiObj.AddDropDownList("x" X " y" Y " w" (Width - 34) " +0x210", [])
+        ApplyDarkControl(this.ServerControl)
 
+        GuiObj.SetFont("s11 c" TextColor, "Segoe UI")
+        this.ServerManagerButton := GuiObj.AddButton("x+8 yp w26 h26", "+")
+        MakeOwnerDrawButton(this.ServerManagerButton)
+
+        Y += 50
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
+        GuiObj.AddText("x" X " y" Y, "Context")
         Y += 29
 
         this.ContextControl := GuiObj.AddComboBox(
-            "x" X " y" Y " w" Width
-            . " +0x210 Background"
-            . SecondaryColor
-            . " c"
-            . TextColor,
-            [
-                "16384",
-                "24576",
-                "32768"
-            ]
+            "x" X " y" Y " w" Width " +0x210 Background" SecondaryColor " c" TextColor,
+            ["16384", "24576", "32768"]
         )
-
         ApplyDarkControl(this.ContextControl)
 
         Y += 50
-
-        GuiObj.AddText(
-            "x" X " y" Y,
-            "KV cache"
-        )
-
+        GuiObj.AddText("x" X " y" Y, "KV cache")
         Y += 29
 
         this.CacheControl := GuiObj.AddDropDownList(
             "x" X " y" Y " w" Width " +0x210",
-            [
-                "f16",
-                "q8_0",
-                "q4_0"
-            ]
+            ["f16", "q8_0", "q4_0"]
         )
-
         ApplyDarkControl(this.CacheControl)
 
-        Y += 45
+        Y += 50
+        GuiObj.AddText("x" X " y" Y, "Model MCP directories")
+        Y += 25
 
-        GuiObj.SetFont(
-            "s10 c" MutedColor,
-            "Segoe UI"
-        )
+        GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
+        GuiObj.AddText("x" X " y" Y " w" Width, "Additional filesystem roots owned by this model.")
+        Y += 25
 
-        this.DefaultsText := GuiObj.AddText(
-            "x" X " y" Y " w" Width,
+        GuiObj.SetFont("s12 Norm c" TextColor, "Segoe UI")
+        this.McpDirectoriesEdit := GuiObj.AddEdit(
+            "x" X " y" Y " w" Width " r3 -VScroll Background" SecondaryColor " c" TextColor,
             ""
         )
 
-        this.Bottom := Y + 24
+        Y += 82
+        GuiObj.SetFont("s10 c" MutedColor, "Segoe UI")
+        this.DefaultsText := GuiObj.AddText("x" X " y" Y " w" Width " h38", "")
+        this.Bottom := Y + 38
 
-        this.ModelControl.OnEvent(
-            "Change",
-            ObjBindMethod(
-                this,
-                "ResetToModelDefaults"
-            )
-        )
+        this.ModelControl.OnEvent("Change", ObjBindMethod(this, "ResetToModelDefaults"))
+        this.AddModelButton.OnEvent("Click", ObjBindMethod(this, "OpenAddModel"))
+        this.DeleteModelButton.OnEvent("Click", ObjBindMethod(this, "DeleteSelectedModel"))
+        this.ServerManagerButton.OnEvent("Click", ObjBindMethod(this, "OpenServerManager"))
 
-        this.SetValues(
-            ModelKey,
-            Context,
-            Cache
-        )
+        this.RefreshModels(ModelKey, false)
+        this.SetValues(ModelKey, Context, Cache, ServerKey)
     }
 
 
-    SetValues(ModelKey, Context := "", Cache := "") {
+    RefreshModels(PreferredModelKey := "", ResetValues := true) {
         global Models, ModelList
+
+        if PreferredModelKey = ""
+            PreferredModelKey := this.GetModelKey()
+
+        Names := []
+        SelectedIndex := 0
+
+        for Index, Key in ModelList {
+            Names.Push(Models[Key].Name)
+
+            if Key = PreferredModelKey
+                SelectedIndex := Index
+        }
+
+        this.ModelControl.Delete()
+        if Names.Length
+            this.ModelControl.Add(Names)
+
+        if !SelectedIndex && Names.Length
+            SelectedIndex := 1
+
+        this.ModelControl.Choose(SelectedIndex)
+
+        HasModel := SelectedIndex > 0
+        this.DeleteModelButton.Enabled := HasModel && ModelList.Length > 1
+        this.ServerControl.Enabled := HasModel
+        this.ContextControl.Enabled := HasModel
+        this.CacheControl.Enabled := HasModel
+        this.McpDirectoriesEdit.Enabled := HasModel
+
+        if ResetValues && HasModel
+            this.ResetToModelDefaults()
+    }
+
+
+    RefreshServers(PreferredServerKey := "") {
+        global Servers, ServerList
+
+        if PreferredServerKey = ""
+            PreferredServerKey := this.GetServerKey()
+
+        Names := []
+        Keys := []
+        SelectedIndex := 0
+
+        if PreferredServerKey != "" && !Servers.Has(PreferredServerKey) {
+            Keys.Push(PreferredServerKey)
+            Names.Push("[Missing] " PreferredServerKey)
+            SelectedIndex := 1
+        }
+
+        for ServerKey in ServerList {
+            if !Servers.Has(ServerKey)
+                continue
+
+            Keys.Push(ServerKey)
+            Names.Push(Servers[ServerKey].Name)
+
+            if ServerKey = PreferredServerKey
+                SelectedIndex := Keys.Length
+        }
+
+        this.ServerControl.Delete()
+        if Names.Length
+            this.ServerControl.Add(Names)
+
+        this.ServerKeys := Keys
+
+        if !SelectedIndex && Keys.Length
+            SelectedIndex := 1
+
+        this.ServerControl.Choose(SelectedIndex)
+    }
+
+
+    SetValues(ModelKey, Context := "", Cache := "", ServerKey := "") {
+        global Models, ModelList
+
+        if !Models.Has(ModelKey)
+            return
 
         for Index, Key in ModelList {
             if Key = ModelKey {
@@ -1008,19 +1125,10 @@ class ModelConfigPanel {
         }
 
         Model := Models[ModelKey]
-
-        this.ContextControl.Text :=
-            Context != ""
-            ? Context
-            : Model.Context
-
-        ChooseCache(
-            this.CacheControl,
-            Cache != ""
-            ? Cache
-            : Model.Cache
-        )
-
+        this.RefreshServers(ServerKey != "" ? ServerKey : Model.ServerKey)
+        this.ContextControl.Text := Context != "" ? Context : Model.Context
+        ChooseCache(this.CacheControl, Cache != "" ? Cache : Model.Cache)
+        this.McpDirectoriesEdit.Text := DirectoriesForEdit(Model.McpDirectories)
         this.UpdateDefaultsText()
     }
 
@@ -1029,66 +1137,149 @@ class ModelConfigPanel {
         global Models
 
         Key := this.GetModelKey()
+        if Key = "" || !Models.Has(Key)
+            return
+
         Model := Models[Key]
-
+        this.RefreshServers(Model.ServerKey)
         this.ContextControl.Text := Model.Context
-
-        ChooseCache(
-            this.CacheControl,
-            Model.Cache
-        )
-
+        ChooseCache(this.CacheControl, Model.Cache)
+        this.McpDirectoriesEdit.Text := DirectoriesForEdit(Model.McpDirectories)
         this.UpdateDefaultsText()
     }
 
 
     UpdateDefaultsText() {
-        global Models
+        global Models, Servers
 
         Key := this.GetModelKey()
+        if Key = "" || !Models.Has(Key) {
+            this.DefaultsText.Text := ""
+            return
+        }
+
         Model := Models[Key]
+        ServerName := Servers.Has(Model.ServerKey)
+            ? Servers[Model.ServerKey].Name
+            : Model.ServerKey != ""
+                ? "Missing: " Model.ServerKey
+                : "Not assigned"
 
         this.DefaultsText.Text :=
-            "Configured defaults:  "
-            . Model.Context
-            . " context  /  "
-            . Model.Cache
-            . " KV"
+            "Configured defaults:  " Model.Context " context  /  " Model.Cache " KV`nServer:  " ServerName
     }
 
 
     GetModelKey() {
         global ModelList
+        Index := this.ModelControl.Value
+        return Index >= 1 && Index <= ModelList.Length ? ModelList[Index] : ""
+    }
 
-        return ModelList[
-            this.ModelControl.Value
-        ]
+
+    GetServerKey() {
+        Index := this.ServerControl.Value
+        return Index >= 1 && Index <= this.ServerKeys.Length ? this.ServerKeys[Index] : ""
     }
 
 
     GetValues() {
-        Context := Trim(
-            this.ContextControl.Text
-        )
+        ModelKey := this.GetModelKey()
+        ServerKey := this.GetServerKey()
+        Context := Trim(this.ContextControl.Text)
+
+        if ModelKey = "" {
+            MsgBox("Select or add a model.", "Local AI", "Icon!")
+            return false
+        }
+
+        if ServerKey = "" {
+            MsgBox("Select a llama server for this model.", "Local AI", "Icon!")
+            return false
+        }
 
         if !IsInteger(Context) || Context <= 0 {
-            MsgBox(
-                "Context must be a positive integer.",
-                "Local AI",
-                "Icon!"
-            )
-
+            MsgBox("Context must be a positive integer.", "Local AI", "Icon!")
             return false
         }
 
         return {
-            ModelKey: this.GetModelKey(),
+            ModelKey: ModelKey,
+            ServerKey: ServerKey,
             Context: Context + 0,
-            Cache: this.CacheControl.Text
+            Cache: this.CacheControl.Text,
+            McpDirectories: DirectoriesFromEdit(this.McpDirectoriesEdit.Text)
         }
     }
-}
 
+
+    OpenAddModel(*) {
+        OpenAddModelDialog(this.Gui, ObjBindMethod(this, "ModelAdded"))
+    }
+
+
+    ModelAdded(ModelKey) {
+        this.RefreshModels(ModelKey)
+        RefreshMainModelControl(ModelKey)
+    }
+
+
+    DeleteSelectedModel(*) {
+        global Models, ModelList
+        global ControllerMode, ActiveModelKey
+
+        ModelKey := this.GetModelKey()
+        if ModelKey = "" || !Models.Has(ModelKey)
+            return
+
+        if ModelList.Length <= 1 {
+            MsgBox(
+                "At least one registered model must remain until first-run Setup is added.",
+                "Delete Model",
+                "Icon!"
+            )
+            return
+        }
+
+        if ControllerMode = "active" && ModelKey = ActiveModelKey {
+            MsgBox(
+                "The model currently assigned to the Active session cannot be deleted.",
+                "Delete Model",
+                "Icon!"
+            )
+            return
+        }
+
+        Model := Models[ModelKey]
+        MainModelKey := GetMainSelectedModelKey()
+        OldIndex := this.ModelControl.Value
+
+        if MsgBox("Delete model '" Model.Name "'?", "Delete Model", "YesNo Icon?") != "Yes"
+            return
+
+        DeleteModel(ModelKey)
+
+        PreferredModelKey := ModelList[Min(OldIndex, ModelList.Length)]
+        this.RefreshModels(PreferredModelKey)
+
+        if MainModelKey = ModelKey
+            MainModelKey := PreferredModelKey
+
+        RefreshMainModelControl(MainModelKey)
+    }
+
+
+    OpenServerManager(*) {
+        OpenServerManager(this.Gui, this.GetServerKey(), ObjBindMethod(this, "ServerRegistryChanged"))
+    }
+
+
+    ServerRegistryChanged(*) {
+        CurrentServerKey := this.GetServerKey()
+        this.RefreshServers(CurrentServerKey)
+        this.UpdateDefaultsText()
+    }
+}
 
 class McpConfigPanel {
     __New(GuiObj, X, Y, Width, Directories) {
@@ -1310,20 +1501,26 @@ StartMasterConfig(
     if !VerifyDirectories(Directories)
         return
 
-    ConfigGui.Destroy()
+    EndConfigDialog(
+        ConfigGui,
+        MainGui,
+        false
+    )
 
     EnterActiveView(
         Values.ModelKey,
         Values.Context,
         Values.Cache,
-        Directories
+        Directories,
+        Values.ServerKey
     )
 
     LaunchAI(
         Values.ModelKey,
         Values.Context,
         Values.Cache,
-        Directories
+        Directories,
+        Values.ServerKey
     )
 }
 
@@ -1608,6 +1805,7 @@ BuildActiveGui() {
 
 OpenModelEditor(*) {
     global ActiveModelKey
+    global ActiveServerKey
     global ActiveContext
     global ActiveCache
 
@@ -1649,7 +1847,8 @@ OpenModelEditor(*) {
         480,
         ActiveModelKey,
         ActiveContext,
-        ActiveCache
+        ActiveCache,
+        ActiveServerKey
     )
 
 
@@ -1717,6 +1916,7 @@ OpenModelEditor(*) {
 
 ApplyModelConfig(EditorGui, ModelPanel) {
     global ActiveModelKey
+    global ActiveServerKey
     global ActiveContext
     global ActiveCache
 
@@ -1733,6 +1933,7 @@ ApplyModelConfig(EditorGui, ModelPanel) {
     ; --------------------------------------------------------
 
     if Values.ModelKey = ActiveModelKey
+    && Values.ServerKey = ActiveServerKey
     && Values.Context = ActiveContext
     && Values.Cache = ActiveCache {
         EndConfigDialog(
@@ -1745,7 +1946,8 @@ ApplyModelConfig(EditorGui, ModelPanel) {
 
 	OldHealthURL :=
 		GetModelHealthURL(
-			ActiveModelKey
+			ActiveModelKey,
+            ActiveServerKey
 		)
 
 	Status :=
@@ -1781,6 +1983,7 @@ ApplyModelConfig(EditorGui, ModelPanel) {
     ; --------------------------------------------------------
 
     ActiveModelKey := Values.ModelKey
+    ActiveServerKey := Values.ServerKey
     ActiveContext := Values.Context
     ActiveCache := Values.Cache
 
@@ -1816,8 +2019,10 @@ SaveModelEditorDefaults(ModelPanel) {
 
     SaveModelDefaults(
         Values.ModelKey,
+        Values.ServerKey,
         Values.Context,
-        Values.Cache
+        Values.Cache,
+        Values.McpDirectories
     )
 
     ModelPanel.UpdateDefaultsText()
@@ -1825,17 +2030,247 @@ SaveModelEditorDefaults(ModelPanel) {
 }
 
 SyncMainModelSelection(ModelKey) {
-    global MainModelControl
-    global ModelList
+    RefreshMainModelControl(
+        ModelKey
+    )
+}
 
-    for Index, Key in ModelList {
-        if Key = ModelKey {
-            MainModelControl.Choose(Index)
-            break
+
+; ============================================================
+;  MODEL REGISTRATION
+; ============================================================
+
+OpenAddModelDialog(ParentGui, OnSaved := 0) {
+    global ModelRegistrationState
+    global BaseColor, SecondaryColor, TextColor, MutedColor
+
+    if IsObject(ModelRegistrationState) {
+        try {
+            ModelRegistrationState.Gui.Show()
+            WinActivate("ahk_id " ModelRegistrationState.Gui.Hwnd)
+            return
         }
+        catch
+            ModelRegistrationState := 0
     }
 
-    UpdateMainModelInfo()
+    DialogGui := Gui(, "Add Model")
+    DialogGui.Opt("+Owner" ParentGui.Hwnd " -MinimizeBox -MaximizeBox")
+    ParentGui.Opt("+Disabled")
+    DialogGui.BackColor := BaseColor
+    DialogGui.MarginX := 24
+    DialogGui.MarginY := 20
+    ApplyDarkWindow(DialogGui)
+
+    DialogGui.SetFont("s14 Bold c" TextColor, "Segoe UI")
+    DialogGui.AddText("xm w480 Center", "ADD MODEL")
+
+    DialogGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
+    DialogGui.AddText("x24 y70", "Name")
+    NameEdit := DialogGui.AddEdit("x24 y99 w480 Background" SecondaryColor " c" TextColor, "")
+
+    DialogGui.AddText("x24 y145", "GGUF model")
+    ModelPathEdit := DialogGui.AddEdit("x24 y174 w438 Background" SecondaryColor " c" TextColor, "")
+
+    DialogGui.SetFont("s11 c" TextColor, "Segoe UI")
+    BrowseButton := DialogGui.AddButton("x470 y173 w34 h26", "…")
+    MakeOwnerDrawButton(BrowseButton)
+
+    DialogGui.SetFont("s12 Norm c" TextColor, "Segoe UI")
+    DialogGui.AddText("x24 y220", "Llama server")
+    ServerControl := DialogGui.AddDropDownList("x24 y249 w446 +0x210", [])
+    ApplyDarkControl(ServerControl)
+
+    DialogGui.SetFont("s11 c" TextColor, "Segoe UI")
+    ServerManagerButton := DialogGui.AddButton("x478 yp w26 h26", "+")
+    MakeOwnerDrawButton(ServerManagerButton)
+
+    DialogGui.SetFont("s10 c" MutedColor, "Segoe UI")
+    DialogGui.AddText(
+        "x24 y295 w480",
+        "New models default to 32768 context, q4_0 KV cache, and no arguments."
+    )
+
+    DialogGui.SetFont("s12 c" TextColor, "Segoe UI")
+    SaveButton := DialogGui.AddButton("x24 y331 w230 h42", "Add Model")
+    CancelButton := DialogGui.AddButton("x274 yp w230 h42", "Cancel")
+    MakeOwnerDrawButton(SaveButton)
+    MakeOwnerDrawButton(CancelButton)
+
+    ModelRegistrationState := {
+        Gui: DialogGui,
+        Parent: ParentGui,
+        OnSaved: OnSaved,
+        NameEdit: NameEdit,
+        ModelPathEdit: ModelPathEdit,
+        ServerControl: ServerControl,
+        ServerKeys: []
+    }
+
+    BrowseButton.OnEvent("Click", (*) => BrowseModelFile(ModelPathEdit))
+    ServerManagerButton.OnEvent(
+        "Click",
+        (*) => OpenServerManager(DialogGui, GetAddModelServerKey(), RefreshAddModelServers)
+    )
+    SaveButton.OnEvent("Click", SaveAddModelDialog)
+    CancelButton.OnEvent("Click", CloseAddModelDialog)
+    DialogGui.OnEvent("Close", CloseAddModelDialog)
+
+    RefreshAddModelServers()
+    ShowRelative(DialogGui, ParentGui)
+}
+
+
+RefreshAddModelServers(PreferredServerKey := "") {
+    global ModelRegistrationState
+    global ServerList, Servers
+
+    if !IsObject(ModelRegistrationState)
+        return
+
+    State := ModelRegistrationState
+    if PreferredServerKey = ""
+        PreferredServerKey := GetAddModelServerKey()
+
+    Names := []
+    Keys := []
+    SelectedIndex := 0
+
+    for ServerKey in ServerList {
+        if !Servers.Has(ServerKey)
+            continue
+
+        Keys.Push(ServerKey)
+        Names.Push(Servers[ServerKey].Name)
+
+        if ServerKey = PreferredServerKey
+            SelectedIndex := Keys.Length
+    }
+
+    State.ServerControl.Delete()
+    if Names.Length
+        State.ServerControl.Add(Names)
+
+    State.ServerKeys := Keys
+    if !SelectedIndex && Keys.Length
+        SelectedIndex := 1
+
+    State.ServerControl.Choose(SelectedIndex)
+}
+
+
+GetAddModelServerKey() {
+    global ModelRegistrationState
+
+    if !IsObject(ModelRegistrationState)
+        return ""
+
+    State := ModelRegistrationState
+    Index := State.ServerControl.Value
+    return Index >= 1 && Index <= State.ServerKeys.Length ? State.ServerKeys[Index] : ""
+}
+
+
+BrowseModelFile(ModelPathEdit) {
+    SelectedPath := FileSelect(1, Trim(ModelPathEdit.Text), "Select GGUF model", "GGUF models (*.gguf)")
+
+    if SelectedPath != ""
+        ModelPathEdit.Text := SelectedPath
+}
+
+
+SaveAddModelDialog(*) {
+    global ModelRegistrationState, Servers
+
+    if !IsObject(ModelRegistrationState)
+        return
+
+    State := ModelRegistrationState
+    Name := Trim(State.NameEdit.Text)
+    ModelPath := Trim(State.ModelPathEdit.Text)
+    ServerKey := GetAddModelServerKey()
+
+    if Name = "" {
+        MsgBox("Enter a name for the model.", "Add Model", "Icon!")
+        return
+    }
+
+    if ModelPath = "" {
+        MsgBox("Enter the GGUF model location.", "Add Model", "Icon!")
+        return
+    }
+
+    if !FileExist(ModelPath) {
+        MsgBox(
+            "Model file not found:`n`n" ModelPath,
+            "Add Model",
+            "Icon!"
+        )
+        return
+    }
+
+    if ServerKey = "" || !Servers.Has(ServerKey) {
+        MsgBox("Select or register a llama server for this model.", "Add Model", "Icon!")
+        return
+    }
+
+    SavedKey := AddModel(Name, ModelPath, ServerKey)
+    Callback := State.OnSaved
+    CloseAddModelDialog()
+
+    if IsObject(Callback)
+        Callback.Call(SavedKey)
+}
+
+
+CloseAddModelDialog(*) {
+    global ModelRegistrationState
+
+    if !IsObject(ModelRegistrationState)
+        return
+
+    State := ModelRegistrationState
+    try State.Gui.Destroy()
+    ModelRegistrationState := 0
+
+    State.Parent.Opt("-Disabled")
+    State.Parent.Show()
+    try WinActivate("ahk_id " State.Parent.Hwnd)
+}
+
+
+GetMainSelectedModelKey() {
+    global MainModelControl, ModelList
+
+    Index := MainModelControl.Value
+    return Index >= 1 && Index <= ModelList.Length ? ModelList[Index] : ""
+}
+
+
+RefreshMainModelControl(PreferredModelKey := "") {
+    global MainModelControl
+    global ModelList, Models
+
+    Names := []
+    SelectedIndex := 0
+
+    for Index, ModelKey in ModelList {
+        Names.Push(Models[ModelKey].Name)
+
+        if ModelKey = PreferredModelKey
+            SelectedIndex := Index
+    }
+
+    MainModelControl.Delete()
+    if Names.Length
+        MainModelControl.Add(Names)
+
+    if !SelectedIndex && Names.Length
+        SelectedIndex := 1
+
+    MainModelControl.Choose(SelectedIndex)
+    if SelectedIndex
+        UpdateMainModelInfo()
 }
 
 ; ============================================================
@@ -2919,22 +3354,20 @@ StopProcessTree(Pid) {
 ;  LAUNCH
 ; ============================================================
 
-LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories) {
+LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories, ServerKeyOverride := "") {
 	global Models
 	global McpPort
     global ActiveHasLaunched
 
     Model := Models[ModelKey]
 	
-	Server :=
-		GetModelServer(
-			ModelKey
-		)
+    ServerKey := ServerKeyOverride != "" ? ServerKeyOverride : Model.ServerKey
+    Server := GetServer(ServerKey)
 
 	if !Server {
 		MsgBox(
 			"The model '" Model.Name "' references an unregistered llama server:`n`n"
-			. Model.ServerKey,
+			. ServerKey,
 			"Local AI",
 			"Iconx"
 		)
@@ -3030,7 +3463,8 @@ LaunchAI(ModelKey, ContextOverride, CacheOverride, Directories) {
 		StartLlama(
 			ModelKey,
 			Context,
-			Cache
+			Cache,
+            ServerKey
 		)
 
         if !WaitForReady(
@@ -3121,7 +3555,8 @@ StartMcp(Directories) {
 StartLlama(
     ModelKey,
     Context,
-    Cache
+    Cache,
+    ServerKey := ""
 ) {
     global Models
 
@@ -3146,10 +3581,10 @@ StartLlama(
     Model :=
         Models[ModelKey]
 
-    Server :=
-        GetModelServer(
-            ModelKey
-        )
+    if ServerKey = ""
+        ServerKey := Model.ServerKey
+
+    Server := GetServer(ServerKey)
 
 
     ; --------------------------------------------------------
@@ -3159,7 +3594,7 @@ StartLlama(
     if !Server {
 	MsgBox(
 		"The model '" Model.Name "' references an unregistered llama server:`n`n"
-		. Model.ServerKey,
+		. ServerKey,
 		"Local AI",
 		"Iconx"
 	)
@@ -3363,6 +3798,7 @@ UpdateLlamaState() {
     global LlamaPid
 
     global ActiveModelKey
+    global ActiveServerKey
     global ActiveContext
     global ActiveCache
 
@@ -3395,10 +3831,9 @@ UpdateLlamaState() {
     Model :=
         Models[ActiveModelKey]
 
-    Server :=
-        GetModelServer(
-            ActiveModelKey
-        )
+    Server := GetServer(
+        ActiveServerKey
+    )
 
 
     ; --------------------------------------------------------
@@ -3417,7 +3852,7 @@ UpdateLlamaState() {
 
         ActiveLlamaDetails.Text :=
             "Server not registered: "
-            . Model.ServerKey
+            . ActiveServerKey
 
         ActiveLlamaEditButton.Enabled := true
         ActiveLlamaStartButton.Enabled := true
@@ -3708,11 +4143,12 @@ UpdateMcpState() {
 	return true
 }
 
-EnterActiveView(ModelKey, Context, Cache, Directories) {
+EnterActiveView(ModelKey, Context, Cache, Directories, ServerKey := "") {
     global ControllerMode
     global ActiveHasLaunched
 
     global ActiveModelKey
+    global ActiveServerKey
     global ActiveContext
     global ActiveCache
     global ActiveMcpDirectories
@@ -3743,6 +4179,7 @@ EnterActiveView(ModelKey, Context, Cache, Directories) {
 	global McpStartupUntil, McpStartupGrace
 
 	ActiveModelKey := ModelKey
+    ActiveServerKey := ServerKey != "" ? ServerKey : Models[ModelKey].ServerKey
     ActiveContext := Context
     ActiveCache := Cache
     ActiveMcpDirectories := Directories
@@ -3835,6 +4272,7 @@ EnterActiveView(ModelKey, Context, Cache, Directories) {
 
 StartActiveLlama(*) {
     global ActiveModelKey
+    global ActiveServerKey
     global ActiveContext
     global ActiveCache
 
@@ -3860,7 +4298,8 @@ StartActiveLlama(*) {
     StartLlama(
         ActiveModelKey,
         ActiveContext,
-        ActiveCache
+        ActiveCache,
+        ActiveServerKey
     )
 }
 
@@ -3899,11 +4338,12 @@ RestartLlamaWithOfflineURL(
 }
 
 RestartActiveLlama(*) {
-    global ActiveModelKey
+    global ActiveModelKey, ActiveServerKey
 
     RestartLlamaWithOfflineURL(
         GetModelHealthURL(
-            ActiveModelKey
+            ActiveModelKey,
+            ActiveServerKey
         )
     )
 }
@@ -3911,7 +4351,7 @@ RestartActiveLlama(*) {
 
 StopActiveLlama(*) {
     global LlamaPid
-    global ActiveModelKey
+    global ActiveModelKey, ActiveServerKey
 
     global ActiveLlamaStatus
     global FastPollRate
@@ -3921,10 +4361,9 @@ StopActiveLlama(*) {
         FastPollRate
     )
 
-    Server :=
-        GetModelServer(
-            ActiveModelKey
-        )
+    Server := GetServer(
+        ActiveServerKey
+    )
 
 
     ; --------------------------------------------------------
@@ -4805,6 +5244,15 @@ SaveServerEditor(*) {
         return
     }
 
+    if !FileExist(Executable) {
+        MsgBox(
+            "Llama server executable not found:`n`n" Executable,
+            "Llama Server",
+            "Icon!"
+        )
+        return
+    }
+
     if Address = "" {
         MsgBox("Enter the address used by the llama server.", "Llama Server", "Icon!")
         return
@@ -5093,25 +5541,23 @@ GetServerWebUI(Server) {
 }
 
 
-GetModelWebUI(ModelKey) {
-    Server :=
-        GetModelServer(
-            ModelKey
-        )
+GetModelWebUI(ModelKey, ServerKey := "") {
+    Server := ServerKey != ""
+        ? GetServer(ServerKey)
+        : GetModelServer(ModelKey)
 
     if !Server
         return ""
 
-    return GetServerWebUI(
-        Server
-    )
+    return GetServerWebUI(Server)
 }
 
 
-GetModelHealthURL(ModelKey) {
+GetModelHealthURL(ModelKey, ServerKey := "") {
     WebUI :=
         GetModelWebUI(
-            ModelKey
+            ModelKey,
+            ServerKey
         )
 
     if WebUI = ""
@@ -5170,11 +5616,12 @@ ShowController(*) {
 }
 
 OpenChat(*) {
-    global ActiveModelKey
+    global ActiveModelKey, ActiveServerKey
 
     WebUI :=
         GetModelWebUI(
-            ActiveModelKey
+            ActiveModelKey,
+            ActiveServerKey
         )
 
     if WebUI = "" {
