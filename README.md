@@ -21,26 +21,17 @@ llama-server" stops being quite so simple.
 WinLlama LLM sits on top of that machinery without trying to replace it.
 
 It gives you:
-
--   **One-click model launch and shutdown**  <img align="right" src="https://github.com/roninpawn/Win-Llama-LLM/blob/main/Screenshots/Configure.png" alt="WinLlama LLM Configure Session window" width=315px>
+<img width=315px align="right" src="https://github.com/roninpawn/Win-Llama-LLM/blob/main/Screenshots/Configure.png" alt="WinLlama LLM Configure Session window">
+-   **One-click model launch and shutdown**
 -   **Multiple GGUF model profiles**
--   **Multiple llama-server registrations** --- useful when a model
-    needs a particular build or fork
+-   **Multiple llama-server registrations** -- for when a model needs a certain build or fork
 -   **Per-model context and KV-cache configuration**
--   **Optional per-server command-line arguments**
--   **Persistent last-model selection**
 -   **Live server status and process controls**
--   **Automatic ownership tracking** so WinLlama knows what it launched
-    and what it did not
--   **External-server detection** rather than blindly killing processes
-    it doesn't own
 -   **A built-in console viewer** with live llama and MCP logs
 -   **Session-based rotating logs**
--   **Tail following that gets out of your way when you scroll back**
--   **Configurable console refresh and log-flush intervals**
 -   **Optional local MCP filesystem access**
 -   **Global and per-model MCP directory roots**
--   **First-run setup** that builds a working `config.ini` instead of
+-   **First-run setup** builds a working `config.ini` instead of
     handing you an empty text file and wishing you luck
 -   **A hand-editable INI configuration** when you *do* want to get your
     hands dirty
@@ -51,7 +42,7 @@ And it does all of this in a compact, native Windows interface.
 
 ## The idea
 
-WinLlama does not want to become your AI platform.
+WinLlama does not want to become your "AI _platform_."
 <img align="right" src="https://github.com/roninpawn/Win-Llama-LLM/blob/main/Screenshots/Start.png" alt="WinLlama LLM Start window" width=400px>
 
 It does not download models, invent a proprietary model format, hide
@@ -99,41 +90,26 @@ configurable retention.
 MCP health polling is also compressed. Hundreds of consecutive status
 requests do not need to become hundreds of useless log lines.
 
-## MCP filesystem access <img align=right width=400px alt="WinLlama LLM MCP Config window" src="https://github.com/roninpawn/Win-Llama-LLM/blob/main/Screenshots/MCP.png">
+## MCP filesystem access
 
 MCP support is deliberately narrow.
+<img align=right width=400px alt="WinLlama LLM MCP Config window" src="https://github.com/roninpawn/Win-Llama-LLM/blob/main/Screenshots/MCP.png">
 
 WinLlama does **not** attempt to be a universal or remote MCP client.
 Its job is to bootstrap and supervise a local `mcp-proxy` filesystem
-endpoint that your llama-server client can use.
+endpoint that your llama-server client can use to give agentic models
+direct access to certain, specific directories.
 
 You can define:
 
 -   **Global roots** available to every model
 -   **Model roots** belonging only to a particular model
 
-At runtime WinLlama unions the applicable roots and exposes the local
-SSE endpoint directly in the Activity window.
+Because Qwen and Phi might share a desk at work. But when they go home
+they sleep in their own beds.
 
-MCP is entirely optional. A failure to start MCP does not prevent your
-model from running.
-
-## First run
-
-If WinLlama cannot find a structurally complete configuration, it walks
-through the same reusable configuration screens used by the rest of the
-application:
-
-1.  Register at least one **llama server**
-2.  Register at least one **GGUF model**
-3.  Optionally configure **MCP Access**
-4.  Arrive at **Start**
-
-For a new registration, WinLlama checks that the executable or GGUF
-actually exists before saving it.
-
-Afterward, configuration lives in `config.ini` beside the application
-and remains intentionally readable and editable.
+MCP is entirely optional. If you don't want models running around your
+discs, they certainly do not have to.
 
 ## Getting started
 
@@ -146,8 +122,8 @@ and remains intentionally readable and editable.
 5.  Configure MCP if you want it, or skip it.
 6.  Press **Start**.
 
-WinLlama opens the llama-server web UI through **Open Chat** once your
-model is online.
+WinLlama opens the llama-server web UI automatically, or via the 
+**Open Chat** button, once your model is online.
 
 ### Running from source
 
@@ -187,7 +163,7 @@ an opaque database.
 
 Models and llama servers are stored as named sections.
 Application-maintained state is kept separately from the settings a
-human is likely to edit.
+person is likely to want to edit by hand.
 
 That is intentional: **the GUI and the INI are two interfaces to the
 same configuration, not competing systems.**
@@ -239,8 +215,8 @@ configuration and log output.
 
 ## License
 
-See the repository's license file for the terms under which WinLlama LLM
-is distributed.
+MIT. See the repository's license file for the exact terms under which
+WinLlama LLM is distributed.
 
 ------------------------------------------------------------------------
 
