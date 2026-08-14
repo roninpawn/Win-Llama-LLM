@@ -105,8 +105,8 @@ You can define:
 -   **Global roots** available to every model
 -   **Model roots** belonging only to a particular model
 
-Because Qwen and Phi might share a desk at work. But when they go home
-they sleep in their own beds.
+So Qwen, Phi, and Ornith can all share access to the libraries. But
+only Ornith gets to read and edit the project files.
 
 MCP is entirely optional. If you don't want models running around your
 discs, they certainly do not have to.
