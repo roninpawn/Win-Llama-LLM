@@ -115,7 +115,7 @@ discs, they certainly do not have to.
 
 ### Release build
 
-1.  Download the latest **WinLlama LLM** release.
+1.  Download the <a href="https://github.com/roninpawn/Win-Llama-LLM/releases/latest">latest **WinLlama LLM** release</a>.
 2.  Run `WinLlama LLM.exe`.
 3.  Browse to your `llama-server.exe`.
 4.  Add a name and location for your GGUF model.
